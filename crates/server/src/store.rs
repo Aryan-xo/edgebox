@@ -19,6 +19,14 @@ pub struct FunctionInfo {
     pub deployed_at: i64,
 }
 
+/// The latest stored version of a function.
+pub struct Stored {
+    pub version: i64,
+    pub wasm: Vec<u8>,
+    /// Native code from `Runtime::precompile`, if cached.
+    pub compiled: Option<Vec<u8>>,
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
 }
@@ -43,19 +51,29 @@ impl Store {
                  version     INTEGER NOT NULL,
                  wasm        BLOB    NOT NULL,
                  deployed_at INTEGER NOT NULL,
+                 compiled    BLOB,
                  PRIMARY KEY (name, version)
              );",
         )?;
+        // Databases created before the compiled-code cache lack the column.
+        let has_compiled: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('functions') WHERE name = 'compiled'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_compiled {
+            conn.execute("ALTER TABLE functions ADD COLUMN compiled BLOB", [])?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
-    /// Stores `wasm` as the next version of `name`.
+    /// Stores `wasm` (and its compiled form) as the next version of `name`.
     ///
     /// If it is identical to the latest version, nothing is stored and the
     /// latest version is returned.
-    pub fn save(&self, name: &str, wasm: &[u8]) -> Result<FunctionInfo> {
+    pub fn save(&self, name: &str, wasm: &[u8], compiled: &[u8]) -> Result<FunctionInfo> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let latest = tx
@@ -81,8 +99,9 @@ impl Store {
         )?;
         let deployed_at = now();
         tx.execute(
-            "INSERT INTO functions (name, version, wasm, deployed_at) VALUES (?1, ?2, ?3, ?4)",
-            params![name, version, wasm, deployed_at],
+            "INSERT INTO functions (name, version, wasm, deployed_at, compiled)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![name, version, wasm, deployed_at, compiled],
         )?;
         tx.commit()?;
         Ok(FunctionInfo {
@@ -108,16 +127,33 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// The `.wasm` of the latest version of `name`.
-    pub fn latest_wasm(&self, name: &str) -> Result<Option<Vec<u8>>> {
+    /// The latest version of `name`.
+    pub fn latest(&self, name: &str) -> Result<Option<Stored>> {
         let conn = self.conn.lock().unwrap();
         Ok(conn
             .query_row(
-                "SELECT wasm FROM functions WHERE name = ?1 ORDER BY version DESC LIMIT 1",
+                "SELECT version, wasm, compiled FROM functions
+                 WHERE name = ?1 ORDER BY version DESC LIMIT 1",
                 [name],
-                |row| row.get(0),
+                |row| {
+                    Ok(Stored {
+                        version: row.get(0)?,
+                        wasm: row.get(1)?,
+                        compiled: row.get(2)?,
+                    })
+                },
             )
             .optional()?)
+    }
+
+    /// Replaces the cached compiled code of one version.
+    pub fn set_compiled(&self, name: &str, version: i64, compiled: &[u8]) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE functions SET compiled = ?3 WHERE name = ?1 AND version = ?2",
+            params![name, version, compiled],
+        )?;
+        Ok(())
     }
 
     /// Deletes every version of `name`. Returns whether it existed.
@@ -143,9 +179,9 @@ mod tests {
     #[test]
     fn versions_increment_per_function() {
         let store = Store::in_memory().unwrap();
-        assert_eq!(store.save("a", b"1").unwrap().version, 1);
-        assert_eq!(store.save("a", b"22").unwrap().version, 2);
-        assert_eq!(store.save("b", b"1").unwrap().version, 1);
+        assert_eq!(store.save("a", b"1", b"").unwrap().version, 1);
+        assert_eq!(store.save("a", b"22", b"").unwrap().version, 2);
+        assert_eq!(store.save("b", b"1", b"").unwrap().version, 1);
 
         let list = store.list().unwrap();
         assert_eq!(list.len(), 2);
@@ -153,22 +189,40 @@ mod tests {
             (list[0].name.as_str(), list[0].version, list[0].size),
             ("a", 2, 2)
         );
-        assert_eq!(store.latest_wasm("a").unwrap().unwrap(), b"22");
+        assert_eq!(store.latest("a").unwrap().unwrap().wasm, b"22");
+    }
+
+    #[test]
+    fn migrates_databases_without_compiled_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE functions (name TEXT, version INTEGER, wasm BLOB, deployed_at INTEGER,
+                                     PRIMARY KEY (name, version));
+             INSERT INTO functions VALUES ('a', 1, x'00', 0);",
+        )
+        .unwrap();
+        let store = Store::init(conn).unwrap();
+        assert_eq!(store.latest("a").unwrap().unwrap().compiled, None);
+        store.set_compiled("a", 1, b"native").unwrap();
+        assert_eq!(
+            store.latest("a").unwrap().unwrap().compiled.unwrap(),
+            b"native"
+        );
     }
 
     #[test]
     fn identical_redeploy_keeps_version() {
         let store = Store::in_memory().unwrap();
-        assert_eq!(store.save("a", b"same").unwrap().version, 1);
-        assert_eq!(store.save("a", b"same").unwrap().version, 1);
-        assert_eq!(store.save("a", b"new").unwrap().version, 2);
+        assert_eq!(store.save("a", b"same", b"").unwrap().version, 1);
+        assert_eq!(store.save("a", b"same", b"").unwrap().version, 1);
+        assert_eq!(store.save("a", b"new", b"").unwrap().version, 2);
     }
 
     #[test]
     fn delete_removes_all_versions() {
         let store = Store::in_memory().unwrap();
-        store.save("a", b"1").unwrap();
-        store.save("a", b"2").unwrap();
+        store.save("a", b"1", b"").unwrap();
+        store.save("a", b"2", b"").unwrap();
         assert!(store.delete("a").unwrap());
         assert!(!store.delete("a").unwrap());
         assert!(store.list().unwrap().is_empty());

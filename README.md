@@ -4,7 +4,7 @@
 
 A tiny serverless runtime for WebAssembly, written in Rust. Think a mini Cloudflare Workers: give edgebox a function, and it serves HTTP requests with it in a sandbox.
 
-> **Status:** early. Deploy and serve sandboxed HTTP functions today; faster cold starts are next (see [Roadmap](#roadmap)).
+> **Status:** early. Deploy and serve sandboxed HTTP functions today; KV storage and secrets are next (see [Roadmap](#roadmap)).
 
 ## Quickstart
 
@@ -37,6 +37,16 @@ Set `EDGEBOX_TOKEN` on the server and client to require `Authorization: Bearer <
 | `PUT` | `/_api/functions/{name}` | Deploy (`.wasm` body). Returns `{name, version, size, deployed_at}` |
 | `GET` | `/_api/functions` | List latest versions |
 | `DELETE` | `/_api/functions/{name}` | Delete all versions |
+
+## Performance
+
+Every request gets a fresh, isolated instance, and it is still fast (Apple M4 Pro):
+
+- **26.8 µs** per-request cold start
+- **~70k req/s** on one machine
+- **88 µs** to load a function on restart, from cached native code
+
+Details and method in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Sandbox limits
 
@@ -77,7 +87,7 @@ cargo guests && cargo test --workspace
 - [x] HTTP in → WASM → HTTP out
 - [x] Upload & deploy functions (versioned, hot-swapped)
 - [x] Sandbox limits (time, memory)
-- [ ] Sub-millisecond cold starts
+- [x] Sub-millisecond cold starts (26.8 µs)
 - [ ] KV store, secrets, outbound fetch
 - [ ] Metrics, logs, and JavaScript functions
 

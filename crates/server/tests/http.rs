@@ -97,6 +97,26 @@ async fn admin_api_requires_token_when_configured() {
 }
 
 #[tokio::test]
+async fn stale_compiled_cache_is_rebuilt_on_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("edgebox.db");
+    let open = || app_with(Runtime::new().unwrap(), Store::open(&db).unwrap(), None);
+    deploy(&open(), "hello", "http_hello.wasm").await;
+
+    // e.g. native code from an older wasmtime version
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("UPDATE functions SET compiled = x'deadbeef'", [])
+        .unwrap();
+
+    let (status, _) = send(&open(), Method::GET, "/hello", vec![]).await;
+    assert_eq!(status, StatusCode::OK);
+    let cached: Vec<u8> = conn
+        .query_row("SELECT compiled FROM functions", [], |row| row.get(0))
+        .unwrap();
+    assert_ne!(cached, [0xde, 0xad, 0xbe, 0xef], "cache was refreshed");
+}
+
+#[tokio::test]
 async fn functions_survive_restart() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("edgebox.db");

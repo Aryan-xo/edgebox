@@ -9,7 +9,9 @@ use std::path::Path;
 
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::error::Context;
-use wasmtime::{Config, Engine, Result, Store, StoreLimits};
+use wasmtime::{
+    Config, Engine, InstanceAllocationStrategy, PoolingAllocationConfig, Result, Store, StoreLimits,
+};
 use wasmtime_wasi::p2::bindings::sync::Command;
 use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 use wasmtime_wasi::{I32Exit, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
@@ -87,6 +89,13 @@ impl Runtime {
     pub fn with_limits(limits: Limits) -> Result<Self> {
         let mut config = Config::new();
         config.epoch_interruption(true);
+
+        // Pre-reserve memory slots once and reuse them, instead of mmap-ing
+        // fresh memory for every instance.
+        let mut pool = PoolingAllocationConfig::default();
+        pool.max_memory_size(limits.max_memory_bytes);
+        config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
+
         let engine = Engine::new(&config)?;
         limits::start_epoch_ticker(&engine);
 
@@ -136,6 +145,32 @@ impl Runtime {
     pub fn load_http_bytes(&self, wasm: &[u8]) -> Result<HttpFunction> {
         let component =
             Component::new(&self.engine, wasm).context("not a valid WebAssembly component")?;
+        self.prepare_http(&component)
+    }
+
+    /// Compiles a component to native code, for caching.
+    ///
+    /// Load the result with [`Runtime::load_http_precompiled`].
+    pub fn precompile(&self, wasm: &[u8]) -> Result<Vec<u8>> {
+        self.engine
+            .precompile_component(wasm)
+            .context("not a valid WebAssembly component")
+    }
+
+    /// Loads an HTTP function from [`Runtime::precompile`] output, skipping compilation.
+    ///
+    /// Artifacts from a different wasmtime version or engine config are
+    /// rejected with an error; callers should then recompile from the `.wasm`.
+    ///
+    /// # Safety
+    ///
+    /// `compiled` must be bytes produced by [`Runtime::precompile`]. It is
+    /// native code: wasmtime cannot fully validate it, so loading untrusted
+    /// bytes can run arbitrary code.
+    pub unsafe fn load_http_precompiled(&self, compiled: &[u8]) -> Result<HttpFunction> {
+        // SAFETY: the caller guarantees `compiled` came from `precompile`.
+        let component = unsafe { Component::deserialize(&self.engine, compiled) }
+            .context("failed to load precompiled component")?;
         self.prepare_http(&component)
     }
 

@@ -40,10 +40,7 @@ impl App {
     pub fn new(runtime: Runtime, store: Store, token: Option<String>) -> Result<Arc<Self>> {
         let mut functions = HashMap::new();
         for info in store.list()? {
-            let wasm = store.latest_wasm(&info.name)?.unwrap_or_default();
-            let function = runtime
-                .load_http_bytes(&wasm)
-                .map_err(anyhow::Error::from)
+            let function = load_stored(&runtime, &store, &info.name)
                 .with_context(|| format!("failed to load stored function {:?}", info.name))?;
             functions.insert(info.name, function);
         }
@@ -64,14 +61,17 @@ impl App {
 
     /// Compiles, stores and hot-swaps in a new version of `name`.
     pub fn deploy(&self, name: &str, wasm: &[u8]) -> Result<FunctionInfo, ApiError> {
+        let bad_request = |err| ApiError::new(StatusCode::BAD_REQUEST, format!("{err:#}"));
         validate_name(name).map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
-        let function = self
-            .runtime
-            .load_http_bytes(wasm)
-            .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, format!("{err:#}")))?;
+
+        // Compile once, keep the native code: restarts load it without recompiling.
+        let compiled = self.runtime.precompile(wasm).map_err(bad_request)?;
+        // SAFETY: `compiled` was produced by `precompile` just above.
+        let function =
+            unsafe { self.runtime.load_http_precompiled(&compiled) }.map_err(bad_request)?;
         let info = self
             .store
-            .save(name, wasm)
+            .save(name, wasm, &compiled)
             .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
         self.functions
             .write()
@@ -89,6 +89,24 @@ impl App {
     fn function(&self, name: &str) -> Option<HttpFunction> {
         self.functions.read().unwrap().get(name).cloned()
     }
+}
+
+/// Loads the latest version of `name`, from cached native code when possible.
+fn load_stored(runtime: &Runtime, store: &Store, name: &str) -> Result<HttpFunction> {
+    let stored = store.latest(name)?.context("function was deleted")?;
+    if let Some(compiled) = &stored.compiled {
+        // SAFETY: the cache is only written with `Runtime::precompile` output
+        // (here and in `App::deploy`). Protect the database file accordingly.
+        if let Ok(function) = unsafe { runtime.load_http_precompiled(compiled) } {
+            return Ok(function);
+        }
+    }
+    // No cache, or it was built by another wasmtime version: recompile and refresh it.
+    let compiled = runtime.precompile(&stored.wasm)?;
+    // SAFETY: produced by `precompile` just above.
+    let function = unsafe { runtime.load_http_precompiled(&compiled) }?;
+    store.set_compiled(name, stored.version, &compiled)?;
+    Ok(function)
 }
 
 /// Builds the HTTP router for `app`.

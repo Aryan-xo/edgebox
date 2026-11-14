@@ -12,8 +12,12 @@ impl Guest for HttpHello {
         let path = request.path_with_query().unwrap_or_default();
         let text = format!("Hello from WASM! You requested {path}\n");
 
-        let headers = Fields::from_list(&[("content-type".into(), b"text/plain".to_vec())])
-            .expect("valid header");
+        // A known length lets the server reuse the connection, even for HTTP/1.0 clients.
+        let headers = Fields::from_list(&[
+            ("content-type".into(), b"text/plain".to_vec()),
+            ("content-length".into(), text.len().to_string().into_bytes()),
+        ])
+        .expect("valid headers");
         let response = OutgoingResponse::new(headers);
         let body = response.body().expect("body is taken once");
         ResponseOutparam::set(response_out, Ok(response));
