@@ -1,0 +1,6 @@
+/target
+
+# Local IDE / tool config
+.idea/
+.mcp.json
+.DS_Store

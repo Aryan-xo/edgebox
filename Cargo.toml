@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = ["crates/runtime", "crates/cli", "examples/hello"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+edgebox-runtime = { path = "crates/runtime" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+wasmtime = "50"
+wasmtime-wasi = "50"

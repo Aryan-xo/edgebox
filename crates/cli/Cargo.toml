@@ -1,0 +1,11 @@
+[package]
+name = "edgebox"
+description = "A tiny serverless runtime for WebAssembly functions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+edgebox-runtime.workspace = true
+anyhow.workspace = true
+clap.workspace = true
