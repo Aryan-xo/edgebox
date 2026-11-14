@@ -2,21 +2,24 @@
 
 [![CI](https://github.com/Aryan-xo/edgebox/actions/workflows/ci.yml/badge.svg)](https://github.com/Aryan-xo/edgebox/actions/workflows/ci.yml)
 
-A tiny serverless runtime for WebAssembly, written in Rust. Think a mini Cloudflare Workers: upload a function, and edgebox runs it in a sandbox.
+A tiny serverless runtime for WebAssembly, written in Rust. Think a mini Cloudflare Workers: give edgebox a function, and it serves HTTP requests with it in a sandbox.
 
-> **Status:** early. edgebox can run WASM components from the CLI today. HTTP functions, deploys and sandbox limits are next (see [Roadmap](#roadmap)).
+> **Status:** early. HTTP functions work; deploys and sandbox limits are next (see [Roadmap](#roadmap)).
 
 ## Quickstart
 
 ```sh
 rustup target add wasm32-wasip2
-
 cargo guests   # build the example functions to .wasm
-cargo run -p edgebox -- run target/wasm32-wasip2/release/hello.wasm
-# Hello from WASM!
+
+cargo run -p edgebox -- serve hello=target/wasm32-wasip2/release/http_hello.wasm
+curl localhost:8080/hello/world
+# Hello from WASM! You requested /hello/world
 ```
 
-Arguments after the file are passed to the function:
+`/<name>/...` is routed to the function named `<name>`. Functions use the standard [`wasi:http`](https://github.com/WebAssembly/wasi-http) interface, so components built for other WASI runtimes work too.
+
+edgebox can also run CLI-style components:
 
 ```sh
 cargo run -p edgebox -- run target/wasm32-wasip2/release/hello.wasm foo bar
@@ -24,17 +27,18 @@ cargo run -p edgebox -- run target/wasm32-wasip2/release/hello.wasm foo bar
 
 ## How it works
 
-1. A function is any program compiled to a [WASI](https://wasi.dev) component (`wasm32-wasip2`).
-2. edgebox loads it with [wasmtime](https://wasmtime.dev) and runs it in a sandbox: no file or network access unless granted.
-3. The function's output and exit code are returned to the caller.
+1. A function is a [WASI](https://wasi.dev) component (`wasm32-wasip2`) that exports `wasi:http/incoming-handler`.
+2. edgebox compiles it once with [wasmtime](https://wasmtime.dev), then runs every request in a fresh, isolated instance.
+3. Guests have no file, socket or outbound HTTP access unless granted.
 
 ## Project layout
 
 | Path | Purpose |
 | --- | --- |
-| `crates/runtime` | Library that loads and runs components |
+| `crates/runtime` | Loads and runs components (wasmtime) |
+| `crates/server` | HTTP router (axum): `/<name>` → function |
 | `crates/cli` | The `edgebox` command |
-| `examples/hello` | Example function |
+| `examples/` | Example functions |
 
 ## Development
 
@@ -45,7 +49,7 @@ cargo guests && cargo test --workspace
 ## Roadmap
 
 - [x] Run a `.wasm` component from the CLI
-- [ ] HTTP in → WASM → HTTP out
+- [x] HTTP in → WASM → HTTP out
 - [ ] Upload & deploy functions
 - [ ] Sandbox limits (CPU time, memory)
 - [ ] Sub-millisecond cold starts

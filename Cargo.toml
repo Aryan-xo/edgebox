@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/runtime", "crates/cli", "examples/hello"]
+members = ["crates/runtime", "crates/server", "crates/cli", "examples/hello", "examples/http-hello"]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,7 +9,15 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 edgebox-runtime = { path = "crates/runtime" }
+edgebox-server = { path = "crates/server" }
 anyhow = "1"
+axum = "0.8"
 clap = { version = "4", features = ["derive"] }
+http-body-util = "0.1"
+hyper = "1"
+tokio = "1"
+tower = "0.5"
+wasi = "0.14"
 wasmtime = "50"
 wasmtime-wasi = "50"
+wasmtime-wasi-http = "50"

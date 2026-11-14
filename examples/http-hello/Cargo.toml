@@ -1,0 +1,13 @@
+[package]
+name = "http-hello"
+description = "Example HTTP function: build with `cargo guests`"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasi.workspace = true

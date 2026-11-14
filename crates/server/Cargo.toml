@@ -1,0 +1,15 @@
+[package]
+name = "edgebox-server"
+description = "HTTP server that routes requests to edgebox functions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+edgebox-runtime.workspace = true
+axum.workspace = true
+
+[dev-dependencies]
+http-body-util.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tower = { workspace = true, features = ["util"] }
