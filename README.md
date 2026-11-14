@@ -4,7 +4,7 @@
 
 A tiny serverless runtime for WebAssembly, written in Rust. Think a mini Cloudflare Workers: give edgebox a function, and it serves HTTP requests with it in a sandbox.
 
-> **Status:** early. Deploy and serve HTTP functions today; sandbox limits are next (see [Roadmap](#roadmap)).
+> **Status:** early. Deploy and serve sandboxed HTTP functions today; faster cold starts are next (see [Roadmap](#roadmap)).
 
 ## Quickstart
 
@@ -38,6 +38,17 @@ Set `EDGEBOX_TOKEN` on the server and client to require `Authorization: Bearer <
 | `GET` | `/_api/functions` | List latest versions |
 | `DELETE` | `/_api/functions/{name}` | Delete all versions |
 
+## Sandbox limits
+
+Every request runs with a time and memory budget. A function that blows it is stopped, and the server keeps serving.
+
+| Limit | Default | Flag / env | On violation |
+| --- | --- | --- | --- |
+| Time per request | 10 s | `--timeout-ms` / `EDGEBOX_TIMEOUT_MS` | `504 Gateway Timeout` |
+| Memory per instance | 128 MiB | `--max-memory-mb` / `EDGEBOX_MAX_MEMORY_MB` | `500` (instance trapped) |
+
+Timeouts use wasmtime's epoch interruption, so even `loop {}` is stopped: with `--timeout-ms 50`, an infinite loop returns 504 in ~52 ms and the CPU goes back to idle. Try it with `examples/chaos`.
+
 ## How it works
 
 1. A function is a [WASI](https://wasi.dev) component (`wasm32-wasip2`) that exports `wasi:http/incoming-handler`.
@@ -65,7 +76,7 @@ cargo guests && cargo test --workspace
 - [x] Run a `.wasm` component from the CLI
 - [x] HTTP in → WASM → HTTP out
 - [x] Upload & deploy functions (versioned, hot-swapped)
-- [ ] Sandbox limits (CPU time, memory)
+- [x] Sandbox limits (time, memory)
 - [ ] Sub-millisecond cold starts
 - [ ] KV store, secrets, outbound fetch
 - [ ] Metrics, logs, and JavaScript functions

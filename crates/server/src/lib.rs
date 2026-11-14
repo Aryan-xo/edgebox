@@ -133,6 +133,10 @@ async fn invoke(State(app): State<Arc<App>>, req: Request) -> Response {
 
     match function.handle(req).await {
         Ok(response) => response.map(Body::new),
+        Err(err) if edgebox_runtime::is_timeout(&err) => {
+            eprintln!("function {name:?} timed out: {err}");
+            (StatusCode::GATEWAY_TIMEOUT, "function timed out\n").into_response()
+        }
         Err(err) => {
             eprintln!("function {name:?} failed: {err:?}");
             (StatusCode::INTERNAL_SERVER_ERROR, "function failed\n").into_response()

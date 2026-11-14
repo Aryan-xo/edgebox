@@ -1,10 +1,11 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use edgebox_runtime::Runtime;
+use edgebox_runtime::{Limits, Runtime};
 use edgebox_server::store::Store;
 use edgebox_server::{App, router, validate_name};
 
@@ -39,6 +40,8 @@ enum Command {
         /// Require this bearer token for the admin API
         #[arg(long, env = "EDGEBOX_TOKEN", hide_env_values = true)]
         token: Option<String>,
+        #[command(flatten)]
+        limits: LimitArgs,
     },
     /// Deploy a function to a running server
     Deploy {
@@ -54,6 +57,25 @@ enum Command {
         #[command(flatten)]
         remote: Remote,
     },
+}
+
+#[derive(clap::Args)]
+struct LimitArgs {
+    /// Max time per request, in milliseconds
+    #[arg(long, env = "EDGEBOX_TIMEOUT_MS", default_value_t = 10_000)]
+    timeout_ms: u64,
+    /// Max memory per instance, in MiB
+    #[arg(long, env = "EDGEBOX_MAX_MEMORY_MB", default_value_t = 128)]
+    max_memory_mb: usize,
+}
+
+impl From<LimitArgs> for Limits {
+    fn from(args: LimitArgs) -> Self {
+        Limits {
+            timeout: Duration::from_millis(args.timeout_ms),
+            max_memory_bytes: args.max_memory_mb * 1024 * 1024,
+        }
+    }
 }
 
 #[derive(clap::Args)]
@@ -77,7 +99,8 @@ fn main() -> Result<ExitCode> {
             addr,
             data,
             token,
-        } => serve(functions, addr, data, token)?,
+            limits,
+        } => serve(functions, addr, data, token, limits.into())?,
         Command::Deploy { name, wasm, remote } => deploy(&name, &wasm, &remote)?,
         Command::List { remote } => list(&remote)?,
     }
@@ -89,6 +112,7 @@ fn serve(
     addr: SocketAddr,
     data: PathBuf,
     token: Option<String>,
+    limits: Limits,
 ) -> Result<()> {
     let store = if data.as_os_str() == ":memory:" {
         Store::in_memory()?
@@ -99,7 +123,7 @@ fn serve(
         eprintln!("warning: admin API is open to the network; set --token or EDGEBOX_TOKEN");
     }
 
-    let app = App::new(Runtime::new()?, store, token)?;
+    let app = App::new(Runtime::with_limits(limits)?, store, token)?;
     for (name, path) in functions {
         let wasm =
             std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;

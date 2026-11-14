@@ -3,12 +3,13 @@
 //! Guests get no filesystem, socket or outbound HTTP access unless granted.
 
 mod http;
+mod limits;
 
 use std::path::Path;
 
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::error::Context;
-use wasmtime::{Engine, Result, Store};
+use wasmtime::{Config, Engine, Result, Store, StoreLimits};
 use wasmtime_wasi::p2::bindings::sync::Command;
 use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 use wasmtime_wasi::{I32Exit, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
@@ -17,6 +18,7 @@ use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
 use http::DenyOutbound;
 pub use http::{HttpFunction, ResponseBody};
+pub use limits::{Limits, Timeout, is_timeout};
 
 /// Maximum stdout bytes kept by [`Runtime::run_captured`].
 const CAPTURE_LIMIT: usize = 1024 * 1024;
@@ -27,16 +29,23 @@ struct State {
     http: WasiHttpCtx,
     hooks: DenyOutbound,
     table: ResourceTable,
+    limits: StoreLimits,
 }
 
 impl State {
-    fn new(wasi: WasiCtx) -> Self {
-        Self {
+    /// A store for one instance, with memory and time limits applied.
+    fn new_store(engine: &Engine, wasi: WasiCtx, limits: &Limits) -> Store<State> {
+        let state = Self {
             wasi,
             http: WasiHttpCtx::new(),
             hooks: DenyOutbound,
             table: ResourceTable::new(),
-        }
+            limits: limits.store_limits(),
+        };
+        let mut store = Store::new(engine, state);
+        store.limiter(|state| &mut state.limits);
+        store.set_epoch_deadline(limits.epoch_ticks());
+        store
     }
 }
 
@@ -66,11 +75,20 @@ pub struct Runtime {
     engine: Engine,
     command_linker: Linker<State>,
     http_linker: Linker<State>,
+    limits: Limits,
 }
 
 impl Runtime {
+    /// A runtime with [`Limits::default`].
     pub fn new() -> Result<Self> {
-        let engine = Engine::default();
+        Self::with_limits(Limits::default())
+    }
+
+    pub fn with_limits(limits: Limits) -> Result<Self> {
+        let mut config = Config::new();
+        config.epoch_interruption(true);
+        let engine = Engine::new(&config)?;
+        limits::start_epoch_ticker(&engine);
 
         let mut command_linker = Linker::new(&engine);
         wasmtime_wasi::p2::add_to_linker_sync(&mut command_linker)?;
@@ -85,6 +103,7 @@ impl Runtime {
             engine,
             command_linker,
             http_linker,
+            limits,
         })
     }
 
@@ -126,7 +145,7 @@ impl Runtime {
             .instantiate_pre(component)
             .and_then(ProxyPre::new)
             .context("not an HTTP function (expected the wasi:http/proxy world)")?;
-        Ok(HttpFunction::new(pre))
+        Ok(HttpFunction::new(pre, self.limits))
     }
 
     fn load_component(&self, wasm: &Path) -> Result<Component> {
@@ -142,7 +161,7 @@ impl Runtime {
             .map_or("guest".into(), |name| name.to_string_lossy());
         wasi.arg(program).args(args);
 
-        let mut store = Store::new(&self.engine, State::new(wasi.build()));
+        let mut store = State::new_store(&self.engine, wasi.build(), &self.limits);
 
         let command = Command::instantiate(&mut store, &component, &self.command_linker)
             .context("failed to instantiate component")?;
@@ -153,6 +172,9 @@ impl Runtime {
             // `std::process::exit(n)` in the guest surfaces as an I32Exit trap.
             Err(err) => match err.downcast_ref::<I32Exit>() {
                 Some(exit) => Ok(exit.0),
+                None if limits::is_interrupt(&err) => {
+                    Err(wasmtime::Error::new(Timeout(self.limits.timeout)))
+                }
                 None => Err(err.context("guest trapped")),
             },
         }

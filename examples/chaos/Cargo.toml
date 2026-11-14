@@ -1,0 +1,13 @@
+[package]
+name = "chaos"
+description = "Misbehaving HTTP function for testing sandbox limits"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasi.workspace = true

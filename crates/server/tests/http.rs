@@ -1,74 +1,14 @@
-use std::path::Path;
+mod common;
 
-use axum::Router;
-use axum::body::Body;
-use axum::http::{Method, Request, StatusCode};
+use axum::http::{Method, StatusCode};
+use common::{app, app_with, deploy, guest, send, send_with_token};
 use edgebox_runtime::Runtime;
 use edgebox_server::store::Store;
-use edgebox_server::{App, router};
-use http_body_util::BodyExt;
-use tower::ServiceExt;
-
-fn guest(file: &str) -> Vec<u8> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/wasm32-wasip2/release")
-        .join(file);
-    std::fs::read(&path)
-        .unwrap_or_else(|_| panic!("{} not found: run `cargo guests` first", path.display()))
-}
-
-fn app_with(store: Store, token: Option<&str>) -> Router {
-    let app = App::new(Runtime::new().unwrap(), store, token.map(String::from)).unwrap();
-    router(app)
-}
-
-fn app() -> Router {
-    app_with(Store::in_memory().unwrap(), None)
-}
-
-async fn send(app: &Router, method: Method, uri: &str, body: Vec<u8>) -> (StatusCode, String) {
-    send_with_token(app, method, uri, body, None).await
-}
-
-async fn send_with_token(
-    app: &Router,
-    method: Method,
-    uri: &str,
-    body: Vec<u8>,
-    token: Option<&str>,
-) -> (StatusCode, String) {
-    let mut req = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("host", "localhost");
-    if let Some(token) = token {
-        req = req.header("authorization", format!("Bearer {token}"));
-    }
-    let res = app
-        .clone()
-        .oneshot(req.body(Body::from(body)).unwrap())
-        .await
-        .unwrap();
-    let status = res.status();
-    let body = res.into_body().collect().await.unwrap().to_bytes();
-    (status, String::from_utf8_lossy(&body).into_owned())
-}
-
-async fn deploy_hello(app: &Router) {
-    let (status, body) = send(
-        app,
-        Method::PUT,
-        "/_api/functions/hello",
-        guest("http_hello.wasm"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-}
 
 #[tokio::test]
 async fn deployed_function_serves_requests() {
     let app = app();
-    deploy_hello(&app).await;
+    deploy(&app, "hello", "http_hello.wasm").await;
 
     let (status, body) = send(&app, Method::GET, "/hello/world?x=1", vec![]).await;
     assert_eq!(status, StatusCode::OK);
@@ -105,7 +45,7 @@ async fn unknown_function_is_404() {
 #[tokio::test]
 async fn delete_removes_function() {
     let app = app();
-    deploy_hello(&app).await;
+    deploy(&app, "hello", "http_hello.wasm").await;
 
     let (status, _) = send(&app, Method::DELETE, "/_api/functions/hello", vec![]).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
@@ -140,7 +80,11 @@ async fn rejects_invalid_uploads() {
 
 #[tokio::test]
 async fn admin_api_requires_token_when_configured() {
-    let app = app_with(Store::in_memory().unwrap(), Some("s3cret"));
+    let app = app_with(
+        Runtime::new().unwrap(),
+        Store::in_memory().unwrap(),
+        Some("s3cret"),
+    );
 
     let (status, _) = send(&app, Method::GET, "/_api/functions", vec![]).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -156,10 +100,10 @@ async fn admin_api_requires_token_when_configured() {
 async fn functions_survive_restart() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("edgebox.db");
+    let open = || app_with(Runtime::new().unwrap(), Store::open(&db).unwrap(), None);
 
-    deploy_hello(&app_with(Store::open(&db).unwrap(), None)).await;
+    deploy(&open(), "hello", "http_hello.wasm").await;
 
-    let restarted = app_with(Store::open(&db).unwrap(), None);
-    let (status, _) = send(&restarted, Method::GET, "/hello", vec![]).await;
+    let (status, _) = send(&open(), Method::GET, "/hello", vec![]).await;
     assert_eq!(status, StatusCode::OK);
 }

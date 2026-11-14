@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 http-body-util.workspace = true
 hyper.workspace = true
-tokio = { workspace = true, features = ["rt", "sync"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 wasmtime.workspace = true
 wasmtime-wasi.workspace = true
 wasmtime-wasi-http.workspace = true

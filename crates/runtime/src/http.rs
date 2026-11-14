@@ -6,7 +6,7 @@ use std::future::Future;
 use http_body_util::BodyExt;
 use hyper::body::{Body, Bytes};
 use tokio::sync::oneshot;
-use wasmtime::{Result, Store, bail};
+use wasmtime::{Result, bail};
 use wasmtime_wasi::WasiCtx;
 use wasmtime_wasi_http::p2::bindings::ProxyPre;
 use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
@@ -16,6 +16,7 @@ use wasmtime_wasi_http::{
 };
 
 use crate::State;
+use crate::limits::{self, Limits, Timeout};
 
 /// Body of a response produced by an [`HttpFunction`].
 pub type ResponseBody = HyperOutgoingBody;
@@ -26,15 +27,17 @@ pub type ResponseBody = HyperOutgoingBody;
 #[derive(Clone)]
 pub struct HttpFunction {
     pre: ProxyPre<State>,
+    limits: Limits,
 }
 
 impl HttpFunction {
-    pub(crate) fn new(pre: ProxyPre<State>) -> Self {
-        Self { pre }
+    pub(crate) fn new(pre: ProxyPre<State>, limits: Limits) -> Self {
+        Self { pre, limits }
     }
 
     /// Runs the function on `req` and returns its response.
     ///
+    /// Fails with [`Timeout`] if the function takes longer than its time limit.
     /// Must be called from within a Tokio runtime.
     pub async fn handle<B>(&self, req: hyper::Request<B>) -> Result<hyper::Response<ResponseBody>>
     where
@@ -45,7 +48,7 @@ impl HttpFunction {
             .map(|body| body.map_err(|err| HttpError::InternalError(Some(err.into().to_string()))));
 
         let wasi = WasiCtx::builder().inherit_stdout().inherit_stderr().build();
-        let mut store = Store::new(self.pre.engine(), State::new(wasi));
+        let mut store = State::new_store(self.pre.engine(), wasi, &self.limits);
 
         let (sender, receiver) = oneshot::channel();
         let req = store
@@ -65,12 +68,21 @@ impl HttpFunction {
                 .await
         });
 
-        match receiver.await {
+        // The epoch deadline interrupts running wasm; this timeout also covers a
+        // guest that is blocked waiting (e.g. sleeping) rather than running.
+        let timeout = Timeout(self.limits.timeout);
+        let Ok(response) = tokio::time::timeout(timeout.0, receiver).await else {
+            task.abort();
+            return Err(wasmtime::Error::new(timeout));
+        };
+
+        match response {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(code)) => bail!("function returned an error: {code:?}"),
             // The guest dropped the response handle without using it.
             Err(_) => match task.await {
                 Ok(Ok(())) => bail!("function finished without sending a response"),
+                Ok(Err(err)) if limits::is_interrupt(&err) => Err(wasmtime::Error::new(timeout)),
                 Ok(Err(err)) => Err(err.context("function trapped")),
                 Err(err) => Err(wasmtime::Error::from(err).context("function task panicked")),
             },
