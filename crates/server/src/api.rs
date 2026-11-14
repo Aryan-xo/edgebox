@@ -12,6 +12,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
 use crate::App;
+use crate::logs::LogLine;
 use crate::store::{FunctionConfig, FunctionInfo};
 
 /// `PUT /_api/functions/{name}` with the `.wasm` as the body.
@@ -87,6 +88,29 @@ pub async fn put_config(
 ) -> Result<Json<ConfigView>, ApiError> {
     app.set_config(&name, config.clone())?;
     Ok(Json(config.into()))
+}
+
+/// `GET /_api/functions/{name}/logs`: recent stdout/stderr lines, oldest first.
+pub async fn logs(
+    State(app): State<Arc<App>>,
+    Path(name): Path<String>,
+) -> Result<Json<Vec<LogLine>>, ApiError> {
+    if app.function(&name).is_none() {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("no function named {name:?}"),
+        ));
+    }
+    Ok(Json(app.logs.recent(&name)))
+}
+
+/// `GET /_api/metrics` in the Prometheus text format.
+pub async fn metrics(State(app): State<Arc<App>>) -> impl IntoResponse {
+    let deployed = app.functions.read().unwrap().len();
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        app.metrics.render(deployed),
+    )
 }
 
 /// Requires `Authorization: Bearer <token>` when the server has a token.

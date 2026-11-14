@@ -30,6 +30,18 @@ ab -k -n 50000 -c 50 http://127.0.0.1:8080/hello
 
 Two runs each, same build, only the allocation strategy changed. `ab` is single-threaded, so these numbers are a floor, not a ceiling.
 
+## JavaScript functions
+
+`examples/js-hello` bundles a whole JavaScript engine (StarlingMonkey), so it is a 13 MB component instead of ~130 KB.
+
+| | Rust (`http-hello`) | JavaScript (`js-hello`) |
+| --- | --- | --- |
+| Deploy (compile + store) | ~10 ms | 0.8 s |
+| Throughput, `ab -k -c 20` | ~70k req/s | 4.8k req/s |
+| Median latency | 1 ms | 4 ms |
+
+Every JS request still gets a fresh engine instance, ~1.2 ms each.
+
 ## What made it fast
 
 1. **Pre-instantiation.** Imports are resolved once per function (`InstancePre`), not per request. This is why even the baseline is ~31 µs.

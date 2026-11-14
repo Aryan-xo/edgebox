@@ -1,0 +1,12 @@
+{
+  "name": "edgebox-js-hello",
+  "private": true,
+  "description": "Example edgebox function in JavaScript",
+  "scripts": {
+    "build": "jco componentize app.js --wit wit --world-name hello --out ../../target/wasm32-wasip2/release/js_hello.wasm"
+  },
+  "devDependencies": {
+    "@bytecodealliance/componentize-js": "0.23.0",
+    "@bytecodealliance/jco": "1.42.0"
+  }
+}

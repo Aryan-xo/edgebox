@@ -11,6 +11,7 @@ impl Guest for HttpHello {
     fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
         let path = request.path_with_query().unwrap_or_default();
         let text = format!("Hello from WASM! You requested {path}\n");
+        println!("handled {path}"); // shows up in `edgebox logs hello`
 
         // A known length lets the server reuse the connection, even for HTTP/1.0 clients.
         let headers = Fields::from_list(&[

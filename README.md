@@ -4,7 +4,7 @@
 
 A tiny serverless runtime for WebAssembly, written in Rust. Think a mini Cloudflare Workers: give edgebox a function, and it serves HTTP requests with it in a sandbox.
 
-> **Status:** working end to end: deploy, serve, KV, secrets, outbound HTTP. Metrics and JavaScript functions are next (see [Roadmap](#roadmap)).
+> **Status:** feature-complete for a v0.1: deploy, serve, sandbox limits, KV, secrets, outbound HTTP, logs, metrics, Rust and JavaScript functions (see [Roadmap](#roadmap)).
 
 ## Quickstart
 
@@ -26,6 +26,7 @@ curl localhost:8080/hello/world
 | `edgebox serve [NAME=PATH...]` | Start the server (optionally deploying files at startup) |
 | `edgebox deploy NAME PATH` | Upload a new version; it goes live immediately, no restart |
 | `edgebox list` | Show deployed functions and versions |
+| `edgebox logs NAME` | Show a function's recent stdout/stderr |
 | `edgebox run PATH [ARGS...]` | Run a CLI-style component locally |
 
 ### Admin API
@@ -39,6 +40,8 @@ Set `EDGEBOX_TOKEN` on the server and client to require `Authorization: Bearer <
 | `DELETE` | `/_api/functions/{name}` | Delete all versions, config and KV data |
 | `GET` | `/_api/functions/{name}/config` | Show config (secret values redacted) |
 | `PUT` | `/_api/functions/{name}/config` | Replace config: `{"env": {...}, "allowed_hosts": [...]}` |
+| `GET` | `/_api/functions/{name}/logs` | Recent stdout/stderr lines |
+| `GET` | `/_api/metrics` | Prometheus metrics |
 
 ## What functions can use
 
@@ -60,6 +63,34 @@ curl "localhost:8080/fetch?url=https://example.com/"   # works; any other host â
 ```
 
 Config is kept across redeploys and changes take effect on the next request, with no recompilation.
+
+## Any language that compiles to a component
+
+The examples are in Rust, but any [WASI component](https://component-model.bytecodealliance.org/) that exports `wasi:http/incoming-handler` works. [`examples/js-hello`](examples/js-hello/app.js) is a JavaScript function built with [jco](https://github.com/bytecodealliance/jco):
+
+```js
+addEventListener("fetch", (event) =>
+  event.respondWith(new Response("Hello from JavaScript!\n")),
+);
+```
+
+```sh
+npm --prefix examples/js-hello ci && npm --prefix examples/js-hello run build
+edgebox deploy js target/wasm32-wasip2/release/js_hello.wasm
+```
+
+## Observability
+
+| What | Where |
+| --- | --- |
+| Request log: function, method, path, status, duration | server output (`--log-format json` for JSON; filter with `RUST_LOG`) |
+| A function's stdout/stderr | `edgebox logs NAME`, or `GET /_api/functions/{name}/logs` (last 200 lines) |
+| Prometheus metrics: requests by status, latency histogram, deployed functions | `GET /_api/metrics` |
+
+```text
+$ edgebox logs js
+1794651284802 stdout handling GET /js/demo
+```
 
 ## Performance
 
@@ -113,7 +144,7 @@ cargo guests && cargo test --workspace
 - [x] Sandbox limits (time, memory)
 - [x] Sub-millisecond cold starts (26.8 Âµs)
 - [x] KV store, secrets, outbound fetch
-- [ ] Metrics, logs, and JavaScript functions
+- [x] Metrics, logs, and JavaScript functions
 
 ## License
 

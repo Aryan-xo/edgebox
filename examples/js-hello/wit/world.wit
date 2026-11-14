@@ -1,0 +1,9 @@
+// wasi 0.2.12 WIT from wasmtime-wasi-http, relabeled 0.2.10 to match the
+// wasi:http version StarlingMonkey (inside jco) implements. wasmtime accepts
+// any compatible 0.2.x import.
+package edgebox:js-hello;
+
+// A standard wasi:http function, like the Rust examples.
+world hello {
+  include wasi:http/proxy@0.2.10;
+}

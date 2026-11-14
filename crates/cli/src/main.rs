@@ -42,6 +42,9 @@ enum Command {
         token: Option<String>,
         #[command(flatten)]
         limits: LimitArgs,
+        /// Log output format (filter with RUST_LOG, default `info`)
+        #[arg(long, env = "EDGEBOX_LOG_FORMAT", value_enum, default_value = "text")]
+        log_format: LogFormat,
     },
     /// Deploy a function to a running server
     Deploy {
@@ -63,6 +66,19 @@ enum Command {
         #[command(flatten)]
         remote: Remote,
     },
+    /// Show a function's recent stdout/stderr
+    Logs {
+        /// Function name
+        name: String,
+        #[command(flatten)]
+        remote: Remote,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum LogFormat {
+    Text,
+    Json,
 }
 
 #[derive(clap::Args)]
@@ -106,7 +122,11 @@ fn main() -> Result<ExitCode> {
             data,
             token,
             limits,
-        } => serve(functions, addr, data, token, limits.into())?,
+            log_format,
+        } => {
+            init_logging(log_format);
+            serve(functions, addr, data, token, limits.into())?
+        }
         Command::Deploy {
             name,
             wasm,
@@ -115,6 +135,7 @@ fn main() -> Result<ExitCode> {
             remote,
         } => deploy(&name, &wasm, env, allowed_hosts, &remote)?,
         Command::List { remote } => list(&remote)?,
+        Command::Logs { name, remote } => logs(&name, &remote)?,
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -132,25 +153,21 @@ fn serve(
         Store::open(&data)?
     };
     if token.is_none() && !addr.ip().is_loopback() {
-        eprintln!("warning: admin API is open to the network; set --token or EDGEBOX_TOKEN");
+        tracing::warn!("admin API is open to the network; set --token or EDGEBOX_TOKEN");
     }
 
     let app = App::new(Runtime::with_limits(limits)?, store, token)?;
     for (name, path) in functions {
         let wasm =
             std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-        let info = app
-            .deploy(&name, &wasm)
+        app.deploy(&name, &wasm)
             .with_context(|| format!("failed to deploy {}", path.display()))?;
-        println!("deployed {name} v{} from {}", info.version, path.display());
     }
-    for name in app.function_names() {
-        println!("  /{name}");
-    }
+    tracing::info!(functions = ?app.function_names(), "loaded");
 
     tokio::runtime::Runtime::new()?.block_on(async {
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        println!("edgebox listening on http://{}", listener.local_addr()?);
+        tracing::info!("edgebox listening on http://{}", listener.local_addr()?);
         axum::serve(listener, router(app))
             .with_graceful_shutdown(async {
                 let _ = tokio::signal::ctrl_c().await;
@@ -215,6 +232,33 @@ fn list(remote: &Remote) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn logs(name: &str, remote: &Remote) -> Result<()> {
+    let url = format!(
+        "{}/_api/functions/{name}/logs",
+        remote.server.trim_end_matches('/')
+    );
+    let lines = remote.call(ureq_agent().get(&url).force_send_body(), None)?;
+    for line in lines.as_array().cloned().unwrap_or_default() {
+        println!(
+            "{} {} {}",
+            line["timestamp_ms"],
+            line["stream"].as_str().unwrap_or("?"),
+            line["message"].as_str().unwrap_or("")
+        );
+    }
+    Ok(())
+}
+
+fn init_logging(format: LogFormat) {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    match format {
+        LogFormat::Text => builder.init(),
+        LogFormat::Json => builder.json().init(),
+    }
 }
 
 fn ureq_agent() -> ureq::Agent {

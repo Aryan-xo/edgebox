@@ -5,6 +5,7 @@
 mod http;
 mod kv;
 mod limits;
+mod logs;
 
 use std::sync::Arc;
 
@@ -25,6 +26,7 @@ use http::OutboundPolicy;
 pub use http::{HttpFunction, ResponseBody, Settings};
 pub use kv::{Kv, KvBackend, MAX_KEY_BYTES, MAX_VALUE_BYTES};
 pub use limits::{Limits, Timeout, is_timeout};
+pub use logs::{LogSink, LogStream};
 
 /// Maximum stdout bytes kept by [`Runtime::run_captured`].
 const CAPTURE_LIMIT: usize = 1024 * 1024;

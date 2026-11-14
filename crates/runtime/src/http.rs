@@ -19,6 +19,7 @@ use wasmtime_wasi_http::{
 use crate::State;
 use crate::kv::Kv;
 use crate::limits::{self, Limits, Timeout};
+use crate::logs::{LogPipe, LogSink, LogStream};
 
 /// Body of a response produced by an [`HttpFunction`].
 pub type ResponseBody = HyperOutgoingBody;
@@ -33,6 +34,8 @@ pub struct Settings {
     pub allowed_hosts: Vec<String>,
     /// The function's KV store.
     pub kv: Option<Kv>,
+    /// Where the function's stdout/stderr go. `None` inherits the host's.
+    pub logs: Option<LogSink>,
 }
 
 impl Settings {
@@ -87,11 +90,22 @@ impl HttpFunction {
         let req = req
             .map(|body| body.map_err(|err| HttpError::InternalError(Some(err.into().to_string()))));
 
-        let wasi = WasiCtx::builder()
-            .inherit_stdout()
-            .inherit_stderr()
-            .envs(&self.settings.env)
-            .build();
+        let mut wasi = WasiCtx::builder();
+        wasi.envs(&self.settings.env);
+        match &self.settings.logs {
+            Some(sink) => {
+                let pipe = |stream| LogPipe {
+                    sink: sink.clone(),
+                    stream,
+                };
+                wasi.stdout(pipe(LogStream::Stdout))
+                    .stderr(pipe(LogStream::Stderr));
+            }
+            None => {
+                wasi.inherit_stdout().inherit_stderr();
+            }
+        }
+        let wasi = wasi.build();
         let mut store =
             State::new_store(self.pre.engine(), wasi, &self.limits, self.settings.clone());
 

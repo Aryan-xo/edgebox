@@ -1,13 +1,16 @@
 //! HTTP front door for edgebox.
 //!
 //! - `/<name>/...` runs the function named `<name>`.
-//! - `/_api/...` is the admin API (deploy, list, delete, config).
+//! - `/_api/...` is the admin API (deploy, list, delete, config, logs, metrics).
 
 mod api;
+pub mod logs;
+pub mod metrics;
 pub mod store;
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use axum::Router;
@@ -20,6 +23,8 @@ use axum::routing::{get, put};
 use edgebox_runtime::{HttpFunction, Kv, Runtime, Settings};
 
 pub use crate::api::ApiError;
+use crate::logs::FunctionLogs;
+use crate::metrics::Metrics;
 use crate::store::{FunctionConfig, FunctionInfo, Store};
 
 /// Largest `.wasm` the deploy API accepts.
@@ -31,6 +36,8 @@ pub struct App {
     store: Arc<Store>,
     token: Option<String>,
     functions: RwLock<HashMap<String, HttpFunction>>,
+    logs: Arc<FunctionLogs>,
+    metrics: Metrics,
 }
 
 impl App {
@@ -39,11 +46,13 @@ impl App {
     /// When `token` is set, the admin API requires `Authorization: Bearer <token>`.
     pub fn new(runtime: Runtime, store: Store, token: Option<String>) -> Result<Arc<Self>> {
         let store = Arc::new(store);
+        let logs = Arc::new(FunctionLogs::default());
         let mut functions = HashMap::new();
         for info in store.list()? {
             let function = load_stored(&runtime, &store, &info.name)
                 .with_context(|| format!("failed to load stored function {:?}", info.name))?;
-            let settings = settings(&store, &info.name, store.config(&info.name)?);
+            let config = store.config(&info.name)?;
+            let settings = settings(&store, &logs, &info.name, config);
             functions.insert(info.name, function.with_settings(settings));
         }
         Ok(Arc::new(Self {
@@ -51,6 +60,8 @@ impl App {
             store,
             token,
             functions: RwLock::new(functions),
+            logs,
+            metrics: Metrics::default(),
         }))
     }
 
@@ -74,11 +85,17 @@ impl App {
         let internal = |err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}"));
         let info = self.store.save(name, wasm, &compiled).map_err(internal)?;
         let config = self.store.config(name).map_err(internal)?;
-        let function = function.with_settings(settings(&self.store, name, config));
+        let function = function.with_settings(settings(&self.store, &self.logs, name, config));
         self.functions
             .write()
             .unwrap()
             .insert(name.to_string(), function);
+        tracing::info!(
+            function = name,
+            version = info.version,
+            size = info.size,
+            "deployed"
+        );
         Ok(info)
     }
 
@@ -96,7 +113,7 @@ impl App {
         self.store
             .set_config(name, &config)
             .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
-        let function = function.with_settings(settings(&self.store, name, config));
+        let function = function.with_settings(settings(&self.store, &self.logs, name, config));
         self.functions
             .write()
             .unwrap()
@@ -107,6 +124,11 @@ impl App {
     fn delete(&self, name: &str) -> Result<bool> {
         let existed = self.store.delete(name)?;
         self.functions.write().unwrap().remove(name);
+        self.logs.remove(name);
+        self.metrics.remove(name);
+        if existed {
+            tracing::info!(function = name, "deleted");
+        }
         Ok(existed)
     }
 
@@ -115,12 +137,18 @@ impl App {
     }
 }
 
-/// Runtime settings for `name`: its config plus its own KV namespace.
-fn settings(store: &Arc<Store>, name: &str, config: FunctionConfig) -> Settings {
+/// Runtime settings for `name`: its config, its own KV namespace and its log sink.
+fn settings(
+    store: &Arc<Store>,
+    logs: &Arc<FunctionLogs>,
+    name: &str,
+    config: FunctionConfig,
+) -> Settings {
     Settings {
         env: config.env.into_iter().collect(),
         allowed_hosts: config.allowed_hosts,
         kv: Some(Kv::new(store.clone(), name)),
+        logs: Some(logs.sink(name)),
     }
 }
 
@@ -154,6 +182,8 @@ pub fn router(app: Arc<App>) -> Router {
             "/_api/functions/{name}/config",
             get(api::get_config).put(api::put_config),
         )
+        .route("/_api/functions/{name}/logs", get(api::logs))
+        .route("/_api/metrics", get(api::metrics))
         .route_layer(middleware::from_fn_with_state(app.clone(), api::auth))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES));
 
@@ -186,17 +216,33 @@ async fn invoke(State(app): State<Arc<App>>, req: Request) -> Response {
             .into_response();
     };
 
-    match function.handle(req).await {
+    let method = req.method().clone();
+    let path = req.uri().path().to_owned();
+    let start = Instant::now();
+    let response = match function.handle(req).await {
         Ok(response) => response.map(Body::new),
         Err(err) if edgebox_runtime::is_timeout(&err) => {
-            eprintln!("function {name:?} timed out: {err}");
+            tracing::warn!(function = %name, "{err}");
             (StatusCode::GATEWAY_TIMEOUT, "function timed out\n").into_response()
         }
         Err(err) => {
-            eprintln!("function {name:?} failed: {err:?}");
+            tracing::error!(function = %name, "function failed: {err:#}");
             (StatusCode::INTERNAL_SERVER_ERROR, "function failed\n").into_response()
         }
-    }
+    };
+
+    let elapsed = start.elapsed();
+    let status = response.status().as_u16();
+    app.metrics.record(&name, status, elapsed);
+    tracing::info!(
+        function = %name,
+        %method,
+        path,
+        status,
+        duration_us = elapsed.as_micros() as u64,
+        "request"
+    );
+    response
 }
 
 /// First segment of the path: `/hello/world` → `hello`.
