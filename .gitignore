@@ -4,3 +4,6 @@
 .idea/
 .mcp.json
 .DS_Store
+
+# Local function database
+edgebox.db*

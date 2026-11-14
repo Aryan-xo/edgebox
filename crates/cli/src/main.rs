@@ -2,10 +2,11 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use edgebox_runtime::Runtime;
-use edgebox_server::{Functions, router};
+use edgebox_server::store::Store;
+use edgebox_server::{App, router, validate_name};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -16,7 +17,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run a WASI command component (.wasm)
+    /// Run a WASI command component (.wasm) locally
     Run {
         /// Path to the component
         wasm: PathBuf,
@@ -24,45 +25,97 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Serve HTTP functions: `/<name>/...` is handled by the function `<name>`
+    /// Start the server: `/<name>/...` is handled by the function `<name>`
     Serve {
-        /// Functions to serve, as NAME=PATH (e.g. hello=./hello.wasm)
-        #[arg(required = true, value_parser = parse_function)]
+        /// Functions to deploy at startup, as NAME=PATH (e.g. hello=./hello.wasm)
+        #[arg(value_parser = parse_function)]
         functions: Vec<(String, PathBuf)>,
         /// Address to listen on
-        #[arg(long, default_value = "127.0.0.1:8080")]
+        #[arg(long, env = "EDGEBOX_ADDR", default_value = "127.0.0.1:8080")]
         addr: SocketAddr,
+        /// SQLite database for deployed functions (`:memory:` for none)
+        #[arg(long, env = "EDGEBOX_DATA", default_value = "edgebox.db")]
+        data: PathBuf,
+        /// Require this bearer token for the admin API
+        #[arg(long, env = "EDGEBOX_TOKEN", hide_env_values = true)]
+        token: Option<String>,
     },
+    /// Deploy a function to a running server
+    Deploy {
+        /// Function name (its URL is /<name>)
+        name: String,
+        /// Path to the component
+        wasm: PathBuf,
+        #[command(flatten)]
+        remote: Remote,
+    },
+    /// List functions on a running server
+    List {
+        #[command(flatten)]
+        remote: Remote,
+    },
+}
+
+#[derive(clap::Args)]
+struct Remote {
+    /// Server URL
+    #[arg(long, env = "EDGEBOX_SERVER", default_value = "http://127.0.0.1:8080")]
+    server: String,
+    /// Admin API token
+    #[arg(long, env = "EDGEBOX_TOKEN", hide_env_values = true)]
+    token: Option<String>,
 }
 
 fn main() -> Result<ExitCode> {
     match Cli::parse().command {
         Command::Run { wasm, args } => {
             let code = Runtime::new()?.run(&wasm, &args)?;
-            Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)))
+            return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
         }
-        Command::Serve { functions, addr } => {
-            serve(functions, addr)?;
-            Ok(ExitCode::SUCCESS)
-        }
+        Command::Serve {
+            functions,
+            addr,
+            data,
+            token,
+        } => serve(functions, addr, data, token)?,
+        Command::Deploy { name, wasm, remote } => deploy(&name, &wasm, &remote)?,
+        Command::List { remote } => list(&remote)?,
     }
+    Ok(ExitCode::SUCCESS)
 }
 
-fn serve(functions: Vec<(String, PathBuf)>, addr: SocketAddr) -> Result<()> {
-    let runtime = Runtime::new()?;
-    let mut loaded = Functions::new();
+fn serve(
+    functions: Vec<(String, PathBuf)>,
+    addr: SocketAddr,
+    data: PathBuf,
+    token: Option<String>,
+) -> Result<()> {
+    let store = if data.as_os_str() == ":memory:" {
+        Store::in_memory()?
+    } else {
+        Store::open(&data)?
+    };
+    if token.is_none() && !addr.ip().is_loopback() {
+        eprintln!("warning: admin API is open to the network; set --token or EDGEBOX_TOKEN");
+    }
+
+    let app = App::new(Runtime::new()?, store, token)?;
     for (name, path) in functions {
-        let function = runtime.load_http(&path)?;
-        if loaded.insert(name.clone(), function).is_some() {
-            bail!("function {name:?} given more than once");
-        }
-        println!("  /{name} → {}", path.display());
+        let wasm =
+            std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        let info = app
+            .deploy(&name, &wasm)
+            .with_context(|| format!("failed to deploy {}", path.display()))?;
+        println!("deployed {name} v{} from {}", info.version, path.display());
+    }
+    for name in app.function_names() {
+        println!("  /{name}");
     }
 
     tokio::runtime::Runtime::new()?.block_on(async {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         println!("edgebox listening on http://{}", listener.local_addr()?);
-        axum::serve(listener, router(loaded))
+        axum::serve(listener, router(app))
             .with_graceful_shutdown(async {
                 let _ = tokio::signal::ctrl_c().await;
             })
@@ -71,13 +124,79 @@ fn serve(functions: Vec<(String, PathBuf)>, addr: SocketAddr) -> Result<()> {
     })
 }
 
-/// Parses `NAME=PATH`. Names become URL path segments, so they can't contain `/`.
+fn deploy(name: &str, wasm: &PathBuf, remote: &Remote) -> Result<()> {
+    validate_name(name).map_err(anyhow::Error::msg)?;
+    let bytes =
+        std::fs::read(wasm).with_context(|| format!("failed to read {}", wasm.display()))?;
+    let url = format!(
+        "{}/_api/functions/{name}",
+        remote.server.trim_end_matches('/')
+    );
+    let info = remote.call(ureq_agent().put(&url), Some(&bytes))?;
+    println!(
+        "deployed {} v{} ({} bytes) → {}/{name}",
+        info["name"].as_str().unwrap_or(name),
+        info["version"],
+        info["size"],
+        remote.server.trim_end_matches('/'),
+    );
+    Ok(())
+}
+
+fn list(remote: &Remote) -> Result<()> {
+    let url = format!("{}/_api/functions", remote.server.trim_end_matches('/'));
+    let functions = remote.call(ureq_agent().get(&url).force_send_body(), None)?;
+    let functions = functions.as_array().cloned().unwrap_or_default();
+    if functions.is_empty() {
+        println!("no functions deployed");
+    }
+    for f in functions {
+        println!(
+            "{:<24} v{:<4} {:>9} bytes",
+            f["name"].as_str().unwrap_or("?"),
+            f["version"],
+            f["size"]
+        );
+    }
+    Ok(())
+}
+
+fn ureq_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .into()
+}
+
+impl Remote {
+    /// Sends an admin request and returns the JSON response, or the server's error.
+    fn call(
+        &self,
+        mut req: ureq::RequestBuilder<ureq::typestate::WithBody>,
+        body: Option<&[u8]>,
+    ) -> Result<serde_json::Value> {
+        if let Some(token) = &self.token {
+            req = req.header("authorization", format!("Bearer {token}"));
+        }
+        let mut res = req
+            .send(body.unwrap_or_default())
+            .with_context(|| format!("failed to reach {}", self.server))?;
+        let status = res.status();
+        let text = res.body_mut().read_to_string()?;
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        if !status.is_success() {
+            let message = json["error"].as_str().unwrap_or(&text);
+            bail!("server returned {status}: {message}");
+        }
+        Ok(json)
+    }
+}
+
+/// Parses `NAME=PATH`.
 fn parse_function(arg: &str) -> Result<(String, PathBuf), String> {
     let (name, path) = arg
         .split_once('=')
         .ok_or_else(|| format!("expected NAME=PATH, got {arg:?}"))?;
-    if name.is_empty() || name.contains('/') {
-        return Err(format!("invalid function name {name:?}"));
-    }
+    validate_name(name)?;
     Ok((name.to_string(), PathBuf::from(path)))
 }

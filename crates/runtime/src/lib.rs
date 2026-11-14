@@ -106,19 +106,26 @@ impl Runtime {
         Ok((code, stdout.contents().to_vec()))
     }
 
-    /// Compiles a `wasi:http/proxy` component into a function that serves requests.
+    /// Compiles a `wasi:http/proxy` component file into a function that serves requests.
     pub fn load_http(&self, wasm: &Path) -> Result<HttpFunction> {
         let component = self.load_component(wasm)?;
+        self.prepare_http(&component)
+            .with_context(|| format!("failed to prepare {}", wasm.display()))
+    }
+
+    /// Like [`Runtime::load_http`], from the component's bytes.
+    pub fn load_http_bytes(&self, wasm: &[u8]) -> Result<HttpFunction> {
+        let component =
+            Component::new(&self.engine, wasm).context("not a valid WebAssembly component")?;
+        self.prepare_http(&component)
+    }
+
+    fn prepare_http(&self, component: &Component) -> Result<HttpFunction> {
         let pre = self
             .http_linker
-            .instantiate_pre(&component)
+            .instantiate_pre(component)
             .and_then(ProxyPre::new)
-            .with_context(|| {
-                format!(
-                    "{} is not an HTTP function (expected the wasi:http/proxy world)",
-                    wasm.display()
-                )
-            })?;
+            .context("not an HTTP function (expected the wasi:http/proxy world)")?;
         Ok(HttpFunction::new(pre))
     }
 

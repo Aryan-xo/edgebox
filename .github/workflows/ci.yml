@@ -41,7 +41,7 @@ jobs:
 
       - name: Smoke test HTTP server
         run: |
-          ./target/debug/edgebox serve hello=target/wasm32-wasip2/release/http_hello.wasm &
+          ./target/debug/edgebox serve --data :memory: hello=target/wasm32-wasip2/release/http_hello.wasm &
           for i in $(seq 1 50); do out=$(curl -sf localhost:8080/hello) && break; sleep 0.2; done
           echo "$out"
           test "$out" = "Hello from WASM! You requested /hello"

@@ -1,0 +1,112 @@
+//! Admin API under `/_api`: deploy, list and delete functions.
+
+use std::sync::Arc;
+
+use axum::Json;
+use axum::body::Bytes;
+use axum::extract::{Path, Request, State};
+use axum::http::{StatusCode, header};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use serde::Serialize;
+
+use crate::App;
+use crate::store::FunctionInfo;
+
+/// `PUT /_api/functions/{name}` with the `.wasm` as the body.
+pub async fn deploy(
+    State(app): State<Arc<App>>,
+    Path(name): Path<String>,
+    wasm: Bytes,
+) -> Result<Json<FunctionInfo>, ApiError> {
+    // Compiling is CPU-heavy: keep it off the async workers.
+    let info = tokio::task::spawn_blocking(move || app.deploy(&name, &wasm))
+        .await
+        .map_err(ApiError::internal)??;
+    Ok(Json(info))
+}
+
+/// `GET /_api/functions`
+pub async fn list(State(app): State<Arc<App>>) -> Result<Json<Vec<FunctionInfo>>, ApiError> {
+    Ok(Json(app.store.list().map_err(ApiError::internal)?))
+}
+
+/// `DELETE /_api/functions/{name}`
+pub async fn delete(
+    State(app): State<Arc<App>>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    if app.delete(&name).map_err(ApiError::internal)? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("no function named {name:?}"),
+        ))
+    }
+}
+
+/// Requires `Authorization: Bearer <token>` when the server has a token.
+pub async fn auth(State(app): State<Arc<App>>, req: Request, next: Next) -> Response {
+    if let Some(token) = &app.token {
+        let given = req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or("");
+        if !constant_time_eq(given.as_bytes(), token.as_bytes()) {
+            return ApiError::new(StatusCode::UNAUTHORIZED, "missing or invalid token")
+                .into_response();
+        }
+    }
+    next.run(req).await
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// A JSON error: `{"error": "..."}`.
+#[derive(Debug)]
+pub struct ApiError {
+    status: StatusCode,
+    message: String,
+}
+
+impl ApiError {
+    pub fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+
+    fn internal(err: impl std::fmt::Display) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+    }
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ApiError {}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        #[derive(Serialize)]
+        struct Body {
+            error: String,
+        }
+        (
+            self.status,
+            Json(Body {
+                error: self.message,
+            }),
+        )
+            .into_response()
+    }
+}
