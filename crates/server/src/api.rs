@@ -1,5 +1,6 @@
 //! Admin API under `/_api`: deploy, list and delete functions.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::Json;
@@ -11,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
 use crate::App;
-use crate::store::FunctionInfo;
+use crate::store::{FunctionConfig, FunctionInfo};
 
 /// `PUT /_api/functions/{name}` with the `.wasm` as the body.
 pub async fn deploy(
@@ -44,6 +45,48 @@ pub async fn delete(
             format!("no function named {name:?}"),
         ))
     }
+}
+
+/// A function's config as the API shows it: secret values are never returned.
+#[derive(Serialize)]
+pub struct ConfigView {
+    env: BTreeMap<String, &'static str>,
+    allowed_hosts: Vec<String>,
+}
+
+impl From<FunctionConfig> for ConfigView {
+    fn from(config: FunctionConfig) -> Self {
+        Self {
+            env: config.env.into_keys().map(|k| (k, "<redacted>")).collect(),
+            allowed_hosts: config.allowed_hosts,
+        }
+    }
+}
+
+/// `GET /_api/functions/{name}/config`
+pub async fn get_config(
+    State(app): State<Arc<App>>,
+    Path(name): Path<String>,
+) -> Result<Json<ConfigView>, ApiError> {
+    if app.function(&name).is_none() {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("no function named {name:?}"),
+        ));
+    }
+    let config = app.store.config(&name).map_err(ApiError::internal)?;
+    Ok(Json(config.into()))
+}
+
+/// `PUT /_api/functions/{name}/config` with `{"env": {...}, "allowed_hosts": [...]}`.
+/// Replaces the whole config.
+pub async fn put_config(
+    State(app): State<Arc<App>>,
+    Path(name): Path<String>,
+    Json(config): Json<FunctionConfig>,
+) -> Result<Json<ConfigView>, ApiError> {
+    app.set_config(&name, config.clone())?;
+    Ok(Json(config.into()))
 }
 
 /// Requires `Authorization: Bearer <token>` when the server has a token.

@@ -1,0 +1,13 @@
+[package]
+name = "fetch"
+description = "Example HTTP function that reads a secret and calls other servers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasi.workspace = true

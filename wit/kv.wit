@@ -1,0 +1,19 @@
+package edgebox:kv@0.1.0;
+
+/// A small, durable key-value store. Each function has its own namespace.
+interface store {
+    /// The value stored under `key`, if any.
+    get: func(key: string) -> result<option<list<u8>>, string>;
+
+    /// Stores `value` under `key`, replacing any previous value.
+    /// Keys are at most 512 bytes, values at most 1 MiB.
+    set: func(key: string, value: list<u8>) -> result<_, string>;
+
+    /// Removes `key`. Returns whether it existed.
+    delete: func(key: string) -> result<bool, string>;
+}
+
+/// What edgebox offers functions beyond WASI.
+world imports {
+    import store;
+}

@@ -1,0 +1,14 @@
+[package]
+name = "counter"
+description = "Example HTTP function that counts visits in the KV store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasi.workspace = true
+wit-bindgen.workspace = true

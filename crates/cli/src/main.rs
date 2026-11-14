@@ -49,6 +49,12 @@ enum Command {
         name: String,
         /// Path to the component
         wasm: PathBuf,
+        /// Environment variable (e.g. a secret) for the function, as KEY=VALUE. Repeatable.
+        #[arg(long = "env", value_name = "KEY=VALUE", value_parser = parse_env)]
+        env: Vec<(String, serde_json::Value)>,
+        /// Host the function may call over HTTP (`*.example.com` for subdomains). Repeatable.
+        #[arg(long = "allow-host", value_name = "HOST")]
+        allowed_hosts: Vec<String>,
         #[command(flatten)]
         remote: Remote,
     },
@@ -101,7 +107,13 @@ fn main() -> Result<ExitCode> {
             token,
             limits,
         } => serve(functions, addr, data, token, limits.into())?,
-        Command::Deploy { name, wasm, remote } => deploy(&name, &wasm, &remote)?,
+        Command::Deploy {
+            name,
+            wasm,
+            env,
+            allowed_hosts,
+            remote,
+        } => deploy(&name, &wasm, env, allowed_hosts, &remote)?,
         Command::List { remote } => list(&remote)?,
     }
     Ok(ExitCode::SUCCESS)
@@ -148,7 +160,15 @@ fn serve(
     })
 }
 
-fn deploy(name: &str, wasm: &PathBuf, remote: &Remote) -> Result<()> {
+/// Uploads `wasm`. If `--env` or `--allow-host` is given, also replaces the
+/// function's config; otherwise its existing config is kept.
+fn deploy(
+    name: &str,
+    wasm: &PathBuf,
+    env: Vec<(String, serde_json::Value)>,
+    allowed_hosts: Vec<String>,
+    remote: &Remote,
+) -> Result<()> {
     validate_name(name).map_err(anyhow::Error::msg)?;
     let bytes =
         std::fs::read(wasm).with_context(|| format!("failed to read {}", wasm.display()))?;
@@ -164,6 +184,18 @@ fn deploy(name: &str, wasm: &PathBuf, remote: &Remote) -> Result<()> {
         info["size"],
         remote.server.trim_end_matches('/'),
     );
+
+    if !env.is_empty() || !allowed_hosts.is_empty() {
+        let config = serde_json::json!({
+            "env": env.into_iter().collect::<serde_json::Map<_, _>>(),
+            "allowed_hosts": allowed_hosts,
+        });
+        let req = ureq_agent()
+            .put(format!("{url}/config"))
+            .header("content-type", "application/json");
+        let view = remote.call(req, Some(config.to_string().as_bytes()))?;
+        println!("config: {view}");
+    }
     Ok(())
 }
 
@@ -214,6 +246,14 @@ impl Remote {
         }
         Ok(json)
     }
+}
+
+/// Parses `KEY=VALUE`.
+fn parse_env(arg: &str) -> Result<(String, serde_json::Value), String> {
+    let (key, value) = arg
+        .split_once('=')
+        .ok_or_else(|| format!("expected KEY=VALUE, got {arg:?}"))?;
+    Ok((key.to_string(), value.into()))
 }
 
 /// Parses `NAME=PATH`.

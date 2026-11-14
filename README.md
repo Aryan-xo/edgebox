@@ -4,7 +4,7 @@
 
 A tiny serverless runtime for WebAssembly, written in Rust. Think a mini Cloudflare Workers: give edgebox a function, and it serves HTTP requests with it in a sandbox.
 
-> **Status:** early. Deploy and serve sandboxed HTTP functions today; KV storage and secrets are next (see [Roadmap](#roadmap)).
+> **Status:** working end to end: deploy, serve, KV, secrets, outbound HTTP. Metrics and JavaScript functions are next (see [Roadmap](#roadmap)).
 
 ## Quickstart
 
@@ -36,7 +36,30 @@ Set `EDGEBOX_TOKEN` on the server and client to require `Authorization: Bearer <
 | --- | --- | --- |
 | `PUT` | `/_api/functions/{name}` | Deploy (`.wasm` body). Returns `{name, version, size, deployed_at}` |
 | `GET` | `/_api/functions` | List latest versions |
-| `DELETE` | `/_api/functions/{name}` | Delete all versions |
+| `DELETE` | `/_api/functions/{name}` | Delete all versions, config and KV data |
+| `GET` | `/_api/functions/{name}/config` | Show config (secret values redacted) |
+| `PUT` | `/_api/functions/{name}/config` | Replace config: `{"env": {...}, "allowed_hosts": [...]}` |
+
+## What functions can use
+
+Everything is off by default and granted per function.
+
+| Feature | How | Example |
+| --- | --- | --- |
+| **KV store** | Import `edgebox:kv/store` ([`wit/kv.wit`](wit/kv.wit)). Durable, private to each function | [`counter`](examples/counter/src/lib.rs) |
+| **Secrets** | Environment variables: `edgebox deploy NAME FILE --env API_KEY=...` | [`fetch`](examples/fetch/src/lib.rs) |
+| **Outbound HTTP** | Standard `wasi:http/outgoing-handler`, only to allowed hosts: `--allow-host api.example.com` | [`fetch`](examples/fetch/src/lib.rs) |
+
+```sh
+edgebox deploy counter target/wasm32-wasip2/release/counter.wasm
+curl localhost:8080/counter      # You are visitor #1
+curl localhost:8080/counter      # You are visitor #2
+
+edgebox deploy fetch target/wasm32-wasip2/release/fetch.wasm --allow-host example.com
+curl "localhost:8080/fetch?url=https://example.com/"   # works; any other host → 502
+```
+
+Config is kept across redeploys and changes take effect on the next request, with no recompilation.
 
 ## Performance
 
@@ -64,7 +87,7 @@ Timeouts use wasmtime's epoch interruption, so even `loop {}` is stopped: with `
 1. A function is a [WASI](https://wasi.dev) component (`wasm32-wasip2`) that exports `wasi:http/incoming-handler`.
 2. On deploy, edgebox compiles it with [wasmtime](https://wasmtime.dev), stores it in SQLite as a new version, and swaps it in live.
 3. Every request runs in a fresh, isolated instance.
-4. Guests have no file, socket or outbound HTTP access unless granted.
+4. Guests have no file or socket access, and outbound HTTP only to allowed hosts.
 
 ## Project layout
 
@@ -73,6 +96,7 @@ Timeouts use wasmtime's epoch interruption, so even `loop {}` is stopped: with `
 | `crates/runtime` | Loads and runs components (wasmtime) |
 | `crates/server` | HTTP router (axum), admin API, SQLite store |
 | `crates/cli` | The `edgebox` command |
+| `wit/` | The `edgebox:kv` interface offered to functions |
 | `examples/` | Example functions |
 
 ## Development
@@ -88,7 +112,7 @@ cargo guests && cargo test --workspace
 - [x] Upload & deploy functions (versioned, hot-swapped)
 - [x] Sandbox limits (time, memory)
 - [x] Sub-millisecond cold starts (26.8 µs)
-- [ ] KV store, secrets, outbound fetch
+- [x] KV store, secrets, outbound fetch
 - [ ] Metrics, logs, and JavaScript functions
 
 ## License

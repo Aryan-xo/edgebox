@@ -3,11 +3,14 @@
 //! Guests get no filesystem, socket or outbound HTTP access unless granted.
 
 mod http;
+mod kv;
 mod limits;
+
+use std::sync::Arc;
 
 use std::path::Path;
 
-use wasmtime::component::{Component, Linker, ResourceTable};
+use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
 use wasmtime::error::Context;
 use wasmtime::{
     Config, Engine, InstanceAllocationStrategy, PoolingAllocationConfig, Result, Store, StoreLimits,
@@ -18,8 +21,9 @@ use wasmtime_wasi::{I32Exit, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::p2::bindings::ProxyPre;
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
-use http::DenyOutbound;
-pub use http::{HttpFunction, ResponseBody};
+use http::OutboundPolicy;
+pub use http::{HttpFunction, ResponseBody, Settings};
+pub use kv::{Kv, KvBackend, MAX_KEY_BYTES, MAX_VALUE_BYTES};
 pub use limits::{Limits, Timeout, is_timeout};
 
 /// Maximum stdout bytes kept by [`Runtime::run_captured`].
@@ -29,18 +33,25 @@ const CAPTURE_LIMIT: usize = 1024 * 1024;
 struct State {
     wasi: WasiCtx,
     http: WasiHttpCtx,
-    hooks: DenyOutbound,
+    hooks: OutboundPolicy,
     table: ResourceTable,
     limits: StoreLimits,
+    kv: Option<Kv>,
 }
 
 impl State {
-    /// A store for one instance, with memory and time limits applied.
-    fn new_store(engine: &Engine, wasi: WasiCtx, limits: &Limits) -> Store<State> {
+    /// A store for one instance, with limits and settings applied.
+    fn new_store(
+        engine: &Engine,
+        wasi: WasiCtx,
+        limits: &Limits,
+        settings: Arc<Settings>,
+    ) -> Store<State> {
         let state = Self {
             wasi,
             http: WasiHttpCtx::new(),
-            hooks: DenyOutbound,
+            kv: settings.kv.clone(),
+            hooks: OutboundPolicy(settings),
             table: ResourceTable::new(),
             limits: limits.store_limits(),
         };
@@ -107,6 +118,7 @@ impl Runtime {
         // Still sandboxed: no preopened dirs, and sockets are denied by default.
         wasmtime_wasi::p2::add_to_linker_async(&mut http_linker)?;
         wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut http_linker)?;
+        kv::add_to_linker::<State, HasSelf<State>>(&mut http_linker, |state| state)?;
 
         Ok(Self {
             engine,
@@ -196,7 +208,7 @@ impl Runtime {
             .map_or("guest".into(), |name| name.to_string_lossy());
         wasi.arg(program).args(args);
 
-        let mut store = State::new_store(&self.engine, wasi.build(), &self.limits);
+        let mut store = State::new_store(&self.engine, wasi.build(), &self.limits, Arc::default());
 
         let command = Command::instantiate(&mut store, &component, &self.command_linker)
             .context("failed to instantiate component")?;

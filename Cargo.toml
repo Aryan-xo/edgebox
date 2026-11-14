@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/runtime", "crates/server", "crates/cli", "examples/hello", "examples/http-hello", "examples/chaos"]
+members = ["crates/runtime", "crates/server", "crates/cli", "examples/hello", "examples/http-hello", "examples/chaos", "examples/counter", "examples/fetch"]
 
 [workspace.package]
 version = "0.1.0"
@@ -23,6 +23,7 @@ serde_json = "1"
 rusqlite = { version = "0.42", features = ["bundled"] }
 ureq = "3"
 wasi = "0.14"
+wit-bindgen = "0.63"
 wasmtime = "50"
 wasmtime-wasi = "50"
 wasmtime-wasi-http = "50"

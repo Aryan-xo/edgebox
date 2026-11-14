@@ -1,7 +1,7 @@
 //! HTTP front door for edgebox.
 //!
 //! - `/<name>/...` runs the function named `<name>`.
-//! - `/_api/...` is the admin API (deploy, list, delete).
+//! - `/_api/...` is the admin API (deploy, list, delete, config).
 
 mod api;
 pub mod store;
@@ -17,10 +17,10 @@ use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
-use edgebox_runtime::{HttpFunction, Runtime};
+use edgebox_runtime::{HttpFunction, Kv, Runtime, Settings};
 
 pub use crate::api::ApiError;
-use crate::store::{FunctionInfo, Store};
+use crate::store::{FunctionConfig, FunctionInfo, Store};
 
 /// Largest `.wasm` the deploy API accepts.
 const MAX_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
@@ -28,7 +28,7 @@ const MAX_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
 /// Server state: the runtime, the function store and the live functions.
 pub struct App {
     runtime: Runtime,
-    store: Store,
+    store: Arc<Store>,
     token: Option<String>,
     functions: RwLock<HashMap<String, HttpFunction>>,
 }
@@ -38,11 +38,13 @@ impl App {
     ///
     /// When `token` is set, the admin API requires `Authorization: Bearer <token>`.
     pub fn new(runtime: Runtime, store: Store, token: Option<String>) -> Result<Arc<Self>> {
+        let store = Arc::new(store);
         let mut functions = HashMap::new();
         for info in store.list()? {
             let function = load_stored(&runtime, &store, &info.name)
                 .with_context(|| format!("failed to load stored function {:?}", info.name))?;
-            functions.insert(info.name, function);
+            let settings = settings(&store, &info.name, store.config(&info.name)?);
+            functions.insert(info.name, function.with_settings(settings));
         }
         Ok(Arc::new(Self {
             runtime,
@@ -69,15 +71,37 @@ impl App {
         // SAFETY: `compiled` was produced by `precompile` just above.
         let function =
             unsafe { self.runtime.load_http_precompiled(&compiled) }.map_err(bad_request)?;
-        let info = self
-            .store
-            .save(name, wasm, &compiled)
-            .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+        let internal = |err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}"));
+        let info = self.store.save(name, wasm, &compiled).map_err(internal)?;
+        let config = self.store.config(name).map_err(internal)?;
+        let function = function.with_settings(settings(&self.store, name, config));
         self.functions
             .write()
             .unwrap()
             .insert(name.to_string(), function);
         Ok(info)
+    }
+
+    /// Replaces the config of a live function. Takes effect on the next request.
+    fn set_config(&self, name: &str, config: FunctionConfig) -> Result<(), ApiError> {
+        config
+            .validate()
+            .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+        let Some(function) = self.function(name) else {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                format!("no function named {name:?}"),
+            ));
+        };
+        self.store
+            .set_config(name, &config)
+            .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+        let function = function.with_settings(settings(&self.store, name, config));
+        self.functions
+            .write()
+            .unwrap()
+            .insert(name.to_string(), function);
+        Ok(())
     }
 
     fn delete(&self, name: &str) -> Result<bool> {
@@ -88,6 +112,15 @@ impl App {
 
     fn function(&self, name: &str) -> Option<HttpFunction> {
         self.functions.read().unwrap().get(name).cloned()
+    }
+}
+
+/// Runtime settings for `name`: its config plus its own KV namespace.
+fn settings(store: &Arc<Store>, name: &str, config: FunctionConfig) -> Settings {
+    Settings {
+        env: config.env.into_iter().collect(),
+        allowed_hosts: config.allowed_hosts,
+        kv: Some(Kv::new(store.clone(), name)),
     }
 }
 
@@ -116,6 +149,10 @@ pub fn router(app: Arc<App>) -> Router {
         .route(
             "/_api/functions/{name}",
             put(api::deploy).delete(api::delete),
+        )
+        .route(
+            "/_api/functions/{name}/config",
+            get(api::get_config).put(api::put_config),
         )
         .route_layer(middleware::from_fn_with_state(app.clone(), api::auth))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES));

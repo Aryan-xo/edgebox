@@ -2,6 +2,7 @@
 
 use std::error::Error as StdError;
 use std::future::Future;
+use std::sync::Arc;
 
 use http_body_util::BodyExt;
 use hyper::body::{Body, Bytes};
@@ -16,10 +17,36 @@ use wasmtime_wasi_http::{
 };
 
 use crate::State;
+use crate::kv::Kv;
 use crate::limits::{self, Limits, Timeout};
 
 /// Body of a response produced by an [`HttpFunction`].
 pub type ResponseBody = HyperOutgoingBody;
+
+/// What a function may access beyond its own memory. Everything is off by default.
+#[derive(Clone, Default)]
+pub struct Settings {
+    /// Environment variables (e.g. secrets) the function can read.
+    pub env: Vec<(String, String)>,
+    /// Hosts the function may send HTTP requests to: exact names, or
+    /// `*.example.com` for any subdomain.
+    pub allowed_hosts: Vec<String>,
+    /// The function's KV store.
+    pub kv: Option<Kv>,
+}
+
+impl Settings {
+    fn allows_host(&self, host: &str) -> bool {
+        let host = host.to_ascii_lowercase();
+        self.allowed_hosts.iter().any(|allowed| {
+            let allowed = allowed.to_ascii_lowercase();
+            match allowed.strip_prefix("*.") {
+                Some(domain) => host.ends_with(&format!(".{domain}")),
+                None => host == allowed,
+            }
+        })
+    }
+}
 
 /// A compiled HTTP function, ready to handle requests.
 ///
@@ -28,11 +55,24 @@ pub type ResponseBody = HyperOutgoingBody;
 pub struct HttpFunction {
     pre: ProxyPre<State>,
     limits: Limits,
+    settings: Arc<Settings>,
 }
 
 impl HttpFunction {
     pub(crate) fn new(pre: ProxyPre<State>, limits: Limits) -> Self {
-        Self { pre, limits }
+        Self {
+            pre,
+            limits,
+            settings: Arc::default(),
+        }
+    }
+
+    /// The same compiled function with different settings. No recompilation.
+    pub fn with_settings(&self, settings: Settings) -> Self {
+        Self {
+            settings: Arc::new(settings),
+            ..self.clone()
+        }
     }
 
     /// Runs the function on `req` and returns its response.
@@ -47,8 +87,13 @@ impl HttpFunction {
         let req = req
             .map(|body| body.map_err(|err| HttpError::InternalError(Some(err.into().to_string()))));
 
-        let wasi = WasiCtx::builder().inherit_stdout().inherit_stderr().build();
-        let mut store = State::new_store(self.pre.engine(), wasi, &self.limits);
+        let wasi = WasiCtx::builder()
+            .inherit_stdout()
+            .inherit_stderr()
+            .envs(&self.settings.env)
+            .build();
+        let mut store =
+            State::new_store(self.pre.engine(), wasi, &self.limits, self.settings.clone());
 
         let (sender, receiver) = oneshot::channel();
         let req = store
@@ -92,21 +137,52 @@ impl HttpFunction {
 
 type OutgoingIoFuture = Box<dyn Future<Output = Result<(), HttpError>> + Send>;
 
-/// Rejects every HTTP request a guest tries to send.
-///
-/// Outbound access will be opt-in, per function.
-pub(crate) struct DenyOutbound;
+/// Sends a guest's outgoing HTTP requests only to its allowed hosts.
+pub(crate) struct OutboundPolicy(pub(crate) Arc<Settings>);
 
-impl WasiHttpHooks for DenyOutbound {
+impl WasiHttpHooks for OutboundPolicy {
     fn send_request(
         &mut self,
-        _request: hyper::Request<WasiBody>,
-        _options: Option<RequestOptions>,
+        request: hyper::Request<WasiBody>,
+        options: Option<RequestOptions>,
         _fut: OutgoingIoFuture,
     ) -> Box<
         dyn Future<Output = Result<(hyper::Response<WasiBody>, OutgoingIoFuture), HttpError>>
             + Send,
     > {
-        Box::new(async { Err(HttpError::HttpRequestDenied) })
+        let allowed = request
+            .uri()
+            .host()
+            .is_some_and(|host| self.0.allows_host(host));
+        if !allowed {
+            return Box::new(async { Err(HttpError::HttpRequestDenied) });
+        }
+        Box::new(async move {
+            let (response, io) = wasmtime_wasi_http::default_send_request(request, options).await?;
+            Ok((
+                response.map(BodyExt::boxed_unsync),
+                Box::new(io) as OutgoingIoFuture,
+            ))
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Settings;
+
+    #[test]
+    fn host_allowlist() {
+        let settings = Settings {
+            allowed_hosts: vec!["api.example.com".into(), "*.github.com".into()],
+            ..Settings::default()
+        };
+        assert!(settings.allows_host("api.example.com"));
+        assert!(settings.allows_host("API.Example.com"));
+        assert!(settings.allows_host("raw.github.com"));
+        assert!(!settings.allows_host("github.com"));
+        assert!(!settings.allows_host("example.com"));
+        assert!(!settings.allows_host("api.example.com.evil.net"));
+        assert!(!Settings::default().allows_host("api.example.com"));
     }
 }

@@ -41,12 +41,34 @@ pub async fn send_with_token(
     body: Vec<u8>,
     token: Option<&str>,
 ) -> (StatusCode, String) {
+    let auth = token.map(|token| format!("Bearer {token}"));
+    let headers: Vec<_> = auth.iter().map(|v| ("authorization", v.as_str())).collect();
+    send_with_headers(app, method, uri, body, &headers).await
+}
+
+pub async fn send_json(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    json: serde_json::Value,
+) -> (StatusCode, String) {
+    let headers = [("content-type", "application/json")];
+    send_with_headers(app, method, uri, json.to_string().into_bytes(), &headers).await
+}
+
+pub async fn send_with_headers(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    body: Vec<u8>,
+    headers: &[(&str, &str)],
+) -> (StatusCode, String) {
     let mut req = Request::builder()
         .method(method)
         .uri(uri)
         .header("host", "localhost");
-    if let Some(token) = token {
-        req = req.header("authorization", format!("Bearer {token}"));
+    for (name, value) in headers {
+        req = req.header(*name, *value);
     }
     let res = app
         .clone()
