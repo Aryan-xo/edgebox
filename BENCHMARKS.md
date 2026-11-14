@@ -37,7 +37,7 @@ Two runs each, same build, only the allocation strategy changed. `ab` is single-
 | | Rust (`http-hello`) | JavaScript (`js-hello`) |
 | --- | --- | --- |
 | Deploy (compile + store) | ~10 ms | 0.8 s |
-| Throughput, `ab -k -c 20` | ~70k req/s | 4.8k req/s |
+| Throughput (`ab -k`) | ~70k req/s at `-c 50` | 4.8k req/s at `-c 20` |
 | Median latency | 1 ms | 4 ms |
 
 Every JS request still gets a fresh engine instance, ~1.2 ms each.

@@ -2,9 +2,20 @@
 
 [![CI](https://github.com/Aryan-xo/edgebox/actions/workflows/ci.yml/badge.svg)](https://github.com/Aryan-xo/edgebox/actions/workflows/ci.yml)
 
-A tiny serverless runtime for WebAssembly, written in Rust. Think a mini Cloudflare Workers: give edgebox a function, and it serves HTTP requests with it in a sandbox.
+**A tiny serverless runtime for WebAssembly, written in Rust.** Think a self-hosted mini Cloudflare Workers: deploy a function, and edgebox serves every HTTP request from a **fresh, sandboxed instance**, in microseconds.
 
-> **Status:** feature-complete for a v0.1: deploy, serve, sandbox limits, KV, secrets, outbound HTTP, logs, metrics, Rust and JavaScript functions (see [Roadmap](#roadmap)).
+- ⚡ **26.8 µs** cold start per request, **~70k req/s** on one machine ([benchmarks](BENCHMARKS.md))
+- 🔒 **Sandboxed:** per-request time and memory limits (even `loop {}` is stopped), no file or network access unless granted
+- 🧩 **Any language:** standard `wasi:http` components; Rust and JavaScript examples included
+- 🗄️ **Batteries included:** versioned hot deploys, a KV store, secrets, an outbound HTTP allowlist, logs, Prometheus metrics
+- 📦 **One binary + SQLite.** Docker and Fly.io ready
+
+```text
+$ edgebox deploy hello http_hello.wasm
+deployed hello v1 (130122 bytes) → http://127.0.0.1:8080/hello
+$ curl localhost:8080/hello/world
+Hello from WASM! You requested /hello/world
+```
 
 ## Quickstart
 
@@ -13,23 +24,58 @@ rustup target add wasm32-wasip2
 cargo guests                       # build the example functions to .wasm
 cargo install --path crates/cli    # installs the `edgebox` binary
 
-edgebox serve &                    # starts on 127.0.0.1:8080, stores functions in edgebox.db
+edgebox serve &                    # 127.0.0.1:8080, functions stored in edgebox.db
 edgebox deploy hello target/wasm32-wasip2/release/http_hello.wasm
 curl localhost:8080/hello/world
-# Hello from WASM! You requested /hello/world
 ```
 
-`/<name>/...` is routed to the function named `<name>`. Functions use the standard [`wasi:http`](https://github.com/WebAssembly/wasi-http) interface, so components built for other WASI runtimes work too.
+Or with Docker:
+
+```sh
+docker build -t edgebox .
+docker run -p 8080:8080 -v edgebox-data:/data edgebox serve hello=/opt/edgebox/examples/http_hello.wasm
+```
+
+## How it works
+
+```mermaid
+flowchart LR
+    cli([edgebox CLI]) -->|PUT /_api/functions/name| api
+    client([HTTP client]) -->|GET /name/...| router
+
+    subgraph edgebox [edgebox server]
+        router[axum router] --> api[Admin API]
+        api -->|compile once| wasmtime[wasmtime]
+        wasmtime -->|.wasm + native code| db[(SQLite)]
+        wasmtime -->|pre-instantiated| live[Live functions]
+        router -->|/name/...| live
+        live -->|fresh instance per request| sandbox[Sandbox: time + memory limits]
+        sandbox -->|edgebox:kv| db
+        sandbox -->|stdout / stderr| obs[Logs + metrics]
+    end
+
+    sandbox -->|wasi:http, allowlist only| net([Allowed hosts])
+```
+
+1. A **function** is a [WASI component](https://component-model.bytecodealliance.org/) that exports `wasi:http/incoming-handler`.
+2. **Deploying** compiles it with [wasmtime](https://wasmtime.dev), stores the `.wasm` and the native code in SQLite as a new version, and swaps it in live.
+3. **Each request** gets a brand-new instance from a pre-instantiated template and a pooled memory slot. No state leaks between requests.
+4. The instance can only reach what its config grants: its own KV namespace, its secrets, and its allowed hosts.
+
+## Features
+
+### Deploy and manage
 
 | Command | What it does |
 | --- | --- |
-| `edgebox serve [NAME=PATH...]` | Start the server (optionally deploying files at startup) |
-| `edgebox deploy NAME PATH` | Upload a new version; it goes live immediately, no restart |
-| `edgebox list` | Show deployed functions and versions |
-| `edgebox logs NAME` | Show a function's recent stdout/stderr |
+| `edgebox serve [NAME=PATH...]` | Start the server, optionally deploying files at startup |
+| `edgebox deploy NAME PATH [--env K=V] [--allow-host H]` | Upload a new version; live immediately, no restart |
+| `edgebox list` | Deployed functions and versions |
+| `edgebox logs NAME` | A function's recent stdout/stderr |
 | `edgebox run PATH [ARGS...]` | Run a CLI-style component locally |
 
-### Admin API
+<details>
+<summary>Admin API</summary>
 
 Set `EDGEBOX_TOKEN` on the server and client to require `Authorization: Bearer <token>`.
 
@@ -38,19 +84,21 @@ Set `EDGEBOX_TOKEN` on the server and client to require `Authorization: Bearer <
 | `PUT` | `/_api/functions/{name}` | Deploy (`.wasm` body). Returns `{name, version, size, deployed_at}` |
 | `GET` | `/_api/functions` | List latest versions |
 | `DELETE` | `/_api/functions/{name}` | Delete all versions, config and KV data |
-| `GET` | `/_api/functions/{name}/config` | Show config (secret values redacted) |
-| `PUT` | `/_api/functions/{name}/config` | Replace config: `{"env": {...}, "allowed_hosts": [...]}` |
-| `GET` | `/_api/functions/{name}/logs` | Recent stdout/stderr lines |
+| `GET` / `PUT` | `/_api/functions/{name}/config` | `{"env": {...}, "allowed_hosts": [...]}`; secret values are never returned |
+| `GET` | `/_api/functions/{name}/logs` | Last 200 stdout/stderr lines |
 | `GET` | `/_api/metrics` | Prometheus metrics |
+| `GET` | `/_health` | `ok` (no token needed) |
 
-## What functions can use
+</details>
+
+### What functions can use
 
 Everything is off by default and granted per function.
 
 | Feature | How | Example |
 | --- | --- | --- |
 | **KV store** | Import `edgebox:kv/store` ([`wit/kv.wit`](wit/kv.wit)). Durable, private to each function | [`counter`](examples/counter/src/lib.rs) |
-| **Secrets** | Environment variables: `edgebox deploy NAME FILE --env API_KEY=...` | [`fetch`](examples/fetch/src/lib.rs) |
+| **Secrets** | Environment variables: `--env API_KEY=...` | [`fetch`](examples/fetch/src/lib.rs) |
 | **Outbound HTTP** | Standard `wasi:http/outgoing-handler`, only to allowed hosts: `--allow-host api.example.com` | [`fetch`](examples/fetch/src/lib.rs) |
 
 ```sh
@@ -62,11 +110,18 @@ edgebox deploy fetch target/wasm32-wasip2/release/fetch.wasm --allow-host exampl
 curl "localhost:8080/fetch?url=https://example.com/"   # works; any other host → 502
 ```
 
-Config is kept across redeploys and changes take effect on the next request, with no recompilation.
+### Sandbox limits
 
-## Any language that compiles to a component
+| Limit | Default | Flag / env | On violation |
+| --- | --- | --- | --- |
+| Time per request | 10 s | `--timeout-ms` / `EDGEBOX_TIMEOUT_MS` | `504`, instance stopped |
+| Memory per instance | 128 MiB | `--max-memory-mb` / `EDGEBOX_MAX_MEMORY_MB` | `500`, instance trapped |
 
-The examples are in Rust, but any [WASI component](https://component-model.bytecodealliance.org/) that exports `wasi:http/incoming-handler` works. [`examples/js-hello`](examples/js-hello/app.js) is a JavaScript function built with [jco](https://github.com/bytecodealliance/jco):
+Timeouts use wasmtime's **epoch interruption**, so even a tight `loop {}` that never yields is stopped. With `--timeout-ms 50`, an infinite loop returns 504 in ~52 ms and the CPU goes back to idle. Try it with [`examples/chaos`](examples/chaos/src/lib.rs).
+
+### Any language
+
+[`examples/js-hello`](examples/js-hello/app.js) is a JavaScript function built with [jco](https://github.com/bytecodealliance/jco):
 
 ```js
 addEventListener("fetch", (event) =>
@@ -79,72 +134,68 @@ npm --prefix examples/js-hello ci && npm --prefix examples/js-hello run build
 edgebox deploy js target/wasm32-wasip2/release/js_hello.wasm
 ```
 
-## Observability
+### Observability
 
 | What | Where |
 | --- | --- |
-| Request log: function, method, path, status, duration | server output (`--log-format json` for JSON; filter with `RUST_LOG`) |
-| A function's stdout/stderr | `edgebox logs NAME`, or `GET /_api/functions/{name}/logs` (last 200 lines) |
-| Prometheus metrics: requests by status, latency histogram, deployed functions | `GET /_api/metrics` |
-
-```text
-$ edgebox logs js
-1794651284802 stdout handling GET /js/demo
-```
+| Request log: function, method, path, status, duration | Server output; `--log-format json`, filter with `RUST_LOG` |
+| A function's stdout/stderr | `edgebox logs NAME` |
+| Requests by status, latency histogram, deployed functions | `GET /_api/metrics` (Prometheus) |
 
 ## Performance
 
-Every request gets a fresh, isolated instance, and it is still fast (Apple M4 Pro):
+Apple M4 Pro, release build:
 
-- **26.8 µs** per-request cold start
-- **~70k req/s** on one machine
-- **88 µs** to load a function on restart, from cached native code
+| | |
+| --- | --- |
+| Cold start (fresh instance + handle a request) | **26.8 µs** |
+| Throughput, `ab -k -c 50` | **~70k req/s**, p99 2–3 ms |
+| Load a function on restart (cached native code) | **88 µs** (vs 8.7 ms compiling) |
 
-Details and method in [BENCHMARKS.md](BENCHMARKS.md).
+The pooling allocator alone gave **2.8× the throughput**. Method and details are in [BENCHMARKS.md](BENCHMARKS.md), and the write-up is in [docs/blog](docs/blog/fresh-sandbox-per-request.md).
 
-## Sandbox limits
+## Deploy
 
-Every request runs with a time and memory budget. A function that blows it is stopped, and the server keeps serving.
+**Docker:** see [Quickstart](#quickstart). The image runs as an unprivileged user and keeps data in `/data`.
 
-| Limit | Default | Flag / env | On violation |
-| --- | --- | --- | --- |
-| Time per request | 10 s | `--timeout-ms` / `EDGEBOX_TIMEOUT_MS` | `504 Gateway Timeout` |
-| Memory per instance | 128 MiB | `--max-memory-mb` / `EDGEBOX_MAX_MEMORY_MB` | `500` (instance trapped) |
+**Fly.io:** [`fly.toml`](fly.toml) is ready:
 
-Timeouts use wasmtime's epoch interruption, so even `loop {}` is stopped: with `--timeout-ms 50`, an infinite loop returns 504 in ~52 ms and the CPU goes back to idle. Try it with `examples/chaos`.
-
-## How it works
-
-1. A function is a [WASI](https://wasi.dev) component (`wasm32-wasip2`) that exports `wasi:http/incoming-handler`.
-2. On deploy, edgebox compiles it with [wasmtime](https://wasmtime.dev), stores it in SQLite as a new version, and swaps it in live.
-3. Every request runs in a fresh, isolated instance.
-4. Guests have no file or socket access, and outbound HTTP only to allowed hosts.
+```sh
+fly launch --copy-config --no-deploy --name <your-app>
+fly volumes create edgebox_data --size 1
+fly secrets set EDGEBOX_TOKEN=$(openssl rand -hex 32)
+fly deploy
+```
 
 ## Project layout
 
 | Path | Purpose |
 | --- | --- |
-| `crates/runtime` | Loads and runs components (wasmtime) |
-| `crates/server` | HTTP router (axum), admin API, SQLite store |
-| `crates/cli` | The `edgebox` command |
-| `wit/` | The `edgebox:kv` interface offered to functions |
-| `examples/` | Example functions |
+| [`crates/runtime`](crates/runtime/src/lib.rs) | wasmtime embedding: sandbox, limits, `wasi:http`, KV host, log capture |
+| [`crates/server`](crates/server/src/lib.rs) | axum router, admin API, SQLite store, metrics |
+| [`crates/cli`](crates/cli/src/main.rs) | The `edgebox` command |
+| [`wit/`](wit/kv.wit) | The `edgebox:kv` interface offered to functions |
+| [`examples/`](examples) | Example functions: Rust and JavaScript |
 
 ## Development
 
 ```sh
-cargo guests && cargo test --workspace
+cargo guests && cargo test --workspace     # ~40 unit and integration tests
+cargo bench -p edgebox-runtime             # cold-start benchmarks
 ```
 
 ## Roadmap
 
-- [x] Run a `.wasm` component from the CLI
-- [x] HTTP in → WASM → HTTP out
-- [x] Upload & deploy functions (versioned, hot-swapped)
-- [x] Sandbox limits (time, memory)
-- [x] Sub-millisecond cold starts (26.8 µs)
-- [x] KV store, secrets, outbound fetch
-- [x] Metrics, logs, and JavaScript functions
+- [x] Run components from the CLI
+- [x] HTTP functions over `wasi:http`
+- [x] Versioned deploys with hot swap
+- [x] Time and memory limits
+- [x] Sub-millisecond cold starts
+- [x] KV store, secrets, outbound allowlist
+- [x] Logs, metrics, JavaScript functions
+- [ ] Rollback to a previous version
+- [ ] Per-function limits and rate limiting
+- [ ] Custom domains and routing rules
 
 ## License
 

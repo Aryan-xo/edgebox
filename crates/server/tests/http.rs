@@ -79,6 +79,17 @@ async fn rejects_invalid_uploads() {
 }
 
 #[tokio::test]
+async fn health_check_needs_no_token() {
+    let app = app_with(
+        Runtime::new().unwrap(),
+        Store::in_memory().unwrap(),
+        Some("s3cret"),
+    );
+    let (status, body) = send(&app, Method::GET, "/_health", vec![]).await;
+    assert_eq!((status, body.as_str()), (StatusCode::OK, "ok\n"));
+}
+
+#[tokio::test]
 async fn admin_api_requires_token_when_configured() {
     let app = app_with(
         Runtime::new().unwrap(),

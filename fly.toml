@@ -1,0 +1,39 @@
+# Deploy edgebox to Fly.io:
+#
+#   fly launch --copy-config --no-deploy --name <your-app>
+#   fly volumes create edgebox_data --size 1
+#   fly secrets set EDGEBOX_TOKEN=$(openssl rand -hex 32)
+#   fly deploy
+#
+# Then point the CLI at it:
+#   EDGEBOX_SERVER=https://<your-app>.fly.dev EDGEBOX_TOKEN=... edgebox deploy hello hello.wasm
+
+app = "edgebox"
+primary_region = "iad"
+
+[env]
+  EDGEBOX_ADDR = "0.0.0.0:8080"
+  EDGEBOX_DATA = "/data/edgebox.db"
+
+[mounts]
+  source = "edgebox_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/_health"
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "10s"
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1

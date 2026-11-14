@@ -254,7 +254,11 @@ fn logs(name: &str, remote: &Remote) -> Result<()> {
 fn init_logging(format: LogFormat) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    // Colors only on a terminal, not in `docker logs` or files.
+    let ansi = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(ansi);
     match format {
         LogFormat::Text => builder.init(),
         LogFormat::Json => builder.json().init(),

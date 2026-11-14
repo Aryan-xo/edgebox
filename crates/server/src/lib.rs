@@ -2,6 +2,7 @@
 //!
 //! - `/<name>/...` runs the function named `<name>`.
 //! - `/_api/...` is the admin API (deploy, list, delete, config, logs, metrics).
+//! - `/_health` returns `ok`.
 
 mod api;
 pub mod logs;
@@ -187,7 +188,11 @@ pub fn router(app: Arc<App>) -> Router {
         .route_layer(middleware::from_fn_with_state(app.clone(), api::auth))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES));
 
-    admin.fallback(invoke).with_state(app)
+    admin
+        // Unauthenticated, for load balancers and container health checks.
+        .route("/_health", get(|| async { "ok\n" }))
+        .fallback(invoke)
+        .with_state(app)
 }
 
 /// Function names become URL path segments.
